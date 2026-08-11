@@ -18,7 +18,8 @@ changing `docx_pipeline`:
 
 ```text
 DOCX files -> batch extraction -> deterministic document indexes
-           -> document digests -> cross-document evidence selection
+           -> bounded evidence windows -> hierarchical document digests
+           -> bounded candidate retrieval -> cross-document evidence selection
            -> presentation outline -> provenance validation
 ```
 
@@ -49,6 +50,17 @@ outline = await generate_outline(
 Generated digest, selection, and outline references are rejected if they do
 not resolve through the document index to real normalized blocks, source
 nodes, and assets. Content and summary slides must cite evidence.
+
+Planning requests use finite, provider-neutral input budgets by default. Large
+documents are digested through ordered evidence windows; retrieval shortlists
+window-local candidates before global selection, so the selector never receives
+the full corpus catalogue. Oversized text is split on semantic boundaries with
+an exact character fallback, and oversized text-backed tables are split by rows;
+both retain the original evidence ID and exact source values. Unsupported
+oversized structured forms fail explicitly instead of being truncated.
+`PlanningScaleConfig` accepts an explicit token counter, nested budgets, and an
+optional retriever for offline evaluation or provider-specific deployment. A
+single shared limiter bounds all planning calls.
 
 ### Generate an outline with OpenAI
 
