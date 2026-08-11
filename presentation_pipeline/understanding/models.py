@@ -3,31 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Protocol, TypeVar, runtime_checkable
-
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import ConfigDict, Field, field_validator
 
 from presentation_pipeline.common.models import PipelineModel
-
-
-TStructured = TypeVar("TStructured", bound=BaseModel)
-
-
-@runtime_checkable
-class StructuredGenerator(Protocol):
-    """Minimal adapter boundary for a structured-output LLM provider.
-
-    Implementations receive immutable instructions plus compact provider-safe
-    data and return data accepted by ``response_model``.
-    """
-
-    async def generate(
-        self,
-        *,
-        system_prompt: str,
-        input_data: dict[str, object],
-        response_model: type[TStructured],
-    ) -> TStructured | dict[str, object]: ...
+from presentation_pipeline.common.references import EvidenceRef
+from presentation_pipeline.generation import StructuredGenerator
 
 
 class UnderstandingModel(PipelineModel):
@@ -40,24 +20,6 @@ def _nonempty(value: str) -> str:
     if not value.strip():
         raise ValueError("value must not be blank")
     return value
-
-
-class EvidenceRef(UnderstandingModel):
-    """A claim's immutable reference to indexed evidence."""
-
-    doc_id: str
-    evidence_ids: list[str] = Field(min_length=1)
-
-    _document_id_is_nonempty = field_validator("doc_id")(_nonempty)
-
-    @field_validator("evidence_ids")
-    @classmethod
-    def _evidence_ids_are_unique_and_nonempty(cls, values: list[str]) -> list[str]:
-        if any(not value.strip() for value in values):
-            raise ValueError("evidence IDs must not be blank")
-        if len(set(values)) != len(values):
-            raise ValueError("evidence IDs must be unique within a reference")
-        return values
 
 
 class TopicDigest(UnderstandingModel):

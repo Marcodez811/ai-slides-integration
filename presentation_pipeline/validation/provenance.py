@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from presentation_pipeline.common.references import EvidenceRef
 from presentation_pipeline.planning.models import EvidenceSelection, PresentationOutline, SlidePurpose
-from presentation_pipeline.understanding.models import DocumentDigest, EvidenceRef
+from presentation_pipeline.understanding.models import DocumentDigest
 
 
 class ProvenanceValidationError(ValueError):

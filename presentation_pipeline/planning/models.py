@@ -7,7 +7,7 @@ from enum import Enum
 from pydantic import AliasChoices, ConfigDict, Field, field_validator, model_validator
 
 from presentation_pipeline.common.models import PipelineModel
-from presentation_pipeline.understanding.models import EvidenceRef
+from presentation_pipeline.common.references import EvidenceRef
 
 
 class PlanningModel(PipelineModel):

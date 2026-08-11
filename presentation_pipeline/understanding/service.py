@@ -3,29 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 from collections.abc import Iterable, Sequence
-from typing import Any
 
-from .models import DocumentDigest, StructuredGenerator
+from presentation_pipeline.generation import StructuredGenerator, invoke_structured
+
+from .models import DocumentDigest
 from .prompts import DOCUMENT_DIGEST_PROMPT, build_document_digest_input, document_id
-
-
-async def invoke_structured(
-    generator: StructuredGenerator,
-    system_prompt: str,
-    input_data: dict[str, object],
-    response_model: type[Any],
-) -> Any:
-    """Call the deliberately small adapter protocol and normalize its response."""
-    result = generator.generate(
-        system_prompt=system_prompt,
-        input_data=input_data,
-        response_model=response_model,
-    )
-    if inspect.isawaitable(result):
-        result = await result
-    return response_model.model_validate(result)
 
 
 async def generate_document_digest(
