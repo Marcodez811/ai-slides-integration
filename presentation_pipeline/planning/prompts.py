@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from presentation_pipeline.understanding.models import DocumentDigest
-from presentation_pipeline.understanding.prompts import (
+from presentation_pipeline.indexing.compact import (
     compact_evidence,
     compact_evidence_item,
     compact_sections,
