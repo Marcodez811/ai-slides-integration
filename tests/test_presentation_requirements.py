@@ -20,6 +20,7 @@ from presentation_pipeline.planning.prompts import (
     OUTLINE_PROMPT,
     build_evidence_selection_input,
 )
+from presentation_pipeline.retrieval.models import CandidateEvidence
 from presentation_pipeline.planning.service import generate_presentation_outline
 from presentation_pipeline.understanding.models import DocumentDigest
 from presentation_pipeline.common.references import EvidenceRef
@@ -267,7 +268,9 @@ def test_document_instruction_is_input_data_and_prompt_guard_is_trusted_only() -
     )
     digest_input = build_document_digest_input(artifact, index)
     selection_input = build_evidence_selection_input(
-        [DocumentDigest(doc_id="doc-a", summary="Summary")], [index], _requirements()
+        [DocumentDigest(doc_id="doc-a", summary="Summary")],
+        [CandidateEvidence(doc_id="doc-a", evidence_id="evidence-a", reason="Relevant")],
+        _requirements(), [index],
     )
 
     assert injection in repr(digest_input)
