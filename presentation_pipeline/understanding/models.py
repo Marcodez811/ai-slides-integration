@@ -58,3 +58,57 @@ class DocumentDigest(UnderstandingModel):
             for fact in self.key_facts
             for reference in fact.evidence
         ]
+
+
+class DigestFragment(UnderstandingModel):
+    """A bounded, internal semantic digest used during hierarchical reduction.
+
+    ``fragment_id`` is a transport identifier only.  Evidence references always
+    remain references to the original document index.
+    """
+
+    doc_id: str
+    fragment_id: str
+    summary: str
+    topics: list[TopicDigest] = Field(default_factory=list)
+    key_facts: list[KeyFact] = Field(default_factory=list)
+
+    _document_id_is_nonempty = field_validator("doc_id")(_nonempty)
+    _fragment_id_is_nonempty = field_validator("fragment_id")(_nonempty)
+    _summary_is_nonempty = field_validator("summary")(_nonempty)
+
+    def evidence_refs(self) -> Sequence[EvidenceRef]:
+        return [
+            reference
+            for topic in self.topics
+            for reference in topic.evidence
+        ] + [
+            reference
+            for fact in self.key_facts
+            for reference in fact.evidence
+        ]
+
+
+class ChunkDigest(UnderstandingModel):
+    """The auditable digest of one bounded evidence window."""
+
+    doc_id: str
+    window_id: str
+    summary: str
+    topics: list[TopicDigest] = Field(default_factory=list)
+    key_facts: list[KeyFact] = Field(default_factory=list)
+
+    _document_id_is_nonempty = field_validator("doc_id")(_nonempty)
+    _window_id_is_nonempty = field_validator("window_id")(_nonempty)
+    _summary_is_nonempty = field_validator("summary")(_nonempty)
+
+    def evidence_refs(self) -> Sequence[EvidenceRef]:
+        return [
+            reference
+            for topic in self.topics
+            for reference in topic.evidence
+        ] + [
+            reference
+            for fact in self.key_facts
+            for reference in fact.evidence
+        ]
