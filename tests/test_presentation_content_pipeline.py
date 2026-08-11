@@ -17,16 +17,26 @@ from presentation_pipeline.synthesis import (
     generate_slide_contents,
 )
 from presentation_pipeline.understanding.models import DocumentDigest
+from presentation_pipeline.understanding.models import ChunkDigest
+from presentation_pipeline.retrieval.models import LocalCandidateSelection
 
 
 class _DeterministicPipelineGenerator:
     """Return schema-valid results derived only from each stage's supplied data."""
 
     async def generate(self, *, system_prompt, input_data, response_model):
-        if response_model is DocumentDigest:
+        if response_model in (DocumentDigest, ChunkDigest):
             document = input_data["document"]
+            if response_model is DocumentDigest and "fragments" in input_data:
+                fragment = input_data["fragments"][0]
+                return {
+                    "doc_id": document["doc_id"],
+                    "summary": fragment["summary"],
+                    "topics": fragment["topics"],
+                    "key_facts": fragment["key_facts"],
+                }
             evidence = input_data["evidence"][0]
-            return {
+            result = {
                 "doc_id": document["doc_id"],
                 "summary": "Quarterly growth briefing",
                 "key_facts": [
@@ -41,13 +51,24 @@ class _DeterministicPipelineGenerator:
                     }
                 ],
             }
+            if response_model is ChunkDigest:
+                result["window_id"] = input_data["window"]["window_id"]
+            return result
+        if response_model is LocalCandidateSelection:
+            evidence = input_data["evidence"][0]
+            return {
+                "candidates": [{
+                    "doc_id": input_data["window"]["doc_id"],
+                    "evidence_id": evidence["evidence_id"],
+                    "reason": "Primary source for the briefing",
+                }]
+            }
         if response_model is EvidenceSelection:
-            document = input_data["evidence_catalogue"][0]
-            evidence = document["evidence"][0]
+            evidence = input_data["candidate_evidence"][0]
             return {
                 "selected": [
                     {
-                        "doc_id": document["doc_id"],
+                        "doc_id": evidence["doc_id"],
                         "evidence_id": evidence["evidence_id"],
                         "reason": "Primary source for the briefing",
                     }

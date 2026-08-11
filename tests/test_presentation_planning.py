@@ -21,6 +21,8 @@ from presentation_pipeline.planning.models import (
 )
 from presentation_pipeline.planning.service import generate_presentation_outline
 from presentation_pipeline.understanding.models import DocumentDigest, EvidenceRef, KeyFact
+from presentation_pipeline.understanding.models import ChunkDigest
+from presentation_pipeline.retrieval.models import LocalCandidateSelection, CandidateEvidence
 from presentation_pipeline.understanding.prompts import build_document_digest_input
 from presentation_pipeline.understanding.service import generate_digests
 from presentation_pipeline.validation import (
@@ -70,13 +72,13 @@ class _DigestGenerator:
 
     async def generate(self, *, system_prompt, input_data, response_model):
         self.seen_inputs.append(input_data)
-        if response_model is DocumentDigest:
+        if response_model in (DocumentDigest, ChunkDigest):
             self.active += 1
             self.maximum_active = max(self.maximum_active, self.active)
             doc_id = input_data["document"]["doc_id"]
             await asyncio.sleep(0.02 if doc_id == "doc-a" else 0.001)
             self.active -= 1
-            return DocumentDigest(
+            result = DocumentDigest(
                 doc_id=doc_id,
                 summary=f"Summary {doc_id}",
                 key_facts=[
@@ -86,6 +88,9 @@ class _DigestGenerator:
                     )
                 ],
             )
+            if response_model is ChunkDigest:
+                return ChunkDigest(window_id=input_data["window"]["window_id"], **result.model_dump())
+            return result
         raise AssertionError(response_model)
 
 
@@ -225,14 +230,23 @@ def test_content_and_summary_slides_require_evidence() -> None:
 
 class _PipelineGenerator:
     async def generate(self, *, system_prompt, input_data, response_model):
-        if response_model is DocumentDigest:
+        if response_model in (DocumentDigest, ChunkDigest):
+            doc_id = input_data["document"]["doc_id"]
+            if response_model is ChunkDigest:
+                return ChunkDigest(
+                    doc_id=doc_id, window_id=input_data["window"]["window_id"], summary="A summary",
+                    key_facts=[KeyFact(claim="A fact", evidence=[EvidenceRef(doc_id=doc_id, evidence_ids=[f"evidence-{doc_id}"])])],
+                )
             return DocumentDigest(
                 doc_id="doc-a",
                 summary="A summary",
                 key_facts=[KeyFact(claim="A fact", evidence=[EvidenceRef(doc_id="doc-a", evidence_ids=["evidence-doc-a"])])],
             )
+        if response_model is LocalCandidateSelection:
+            evidence = input_data["evidence"][0]
+            return LocalCandidateSelection(candidates=[CandidateEvidence(doc_id=input_data["window"]["doc_id"], evidence_id=evidence["evidence_id"], reason="central fact")])
         if response_model is EvidenceSelection:
-            assert input_data["evidence_catalogue"]
+            assert input_data["candidate_evidence"]
             return EvidenceSelection(
                 selected=[SelectedEvidence(doc_id="doc-a", evidence_id="evidence-doc-a", reason="central fact")],
                 strategy="Use the key fact",
@@ -318,6 +332,9 @@ def test_generate_plan_preserves_order_and_reusable_intermediates(monkeypatch) -
         return {"doc-a": index_a, "doc-b": index_b}[artifact.doc_id]
     async def generate_digests(*args, **kwargs):
         return digests
+    async def retrieve(*args, **kwargs):
+        from presentation_pipeline.retrieval.models import CandidateEvidenceSet, CandidateEvidence
+        return CandidateEvidenceSet(candidates=[CandidateEvidence(doc_id="doc-a", evidence_id="evidence-doc-a", reason="A")])
     async def select(*args, **kwargs):
         return selection
     async def generate_outline_stage(*args, **kwargs):
@@ -325,6 +342,7 @@ def test_generate_plan_preserves_order_and_reusable_intermediates(monkeypatch) -
     monkeypatch.setattr(pipeline, "extract_batch", extract)
     monkeypatch.setattr(pipeline, "build_document_index", index)
     monkeypatch.setattr(pipeline, "generate_digests", generate_digests)
+    monkeypatch.setattr(pipeline.WindowedLLMEvidenceRetriever, "retrieve", retrieve)
     monkeypatch.setattr(pipeline, "select_evidence", select)
     monkeypatch.setattr(pipeline, "generate_presentation_outline", generate_outline_stage)
 

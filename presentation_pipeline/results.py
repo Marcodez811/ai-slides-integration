@@ -12,6 +12,7 @@ from presentation_pipeline.planning.models import (
     PresentationRequirements,
 )
 from presentation_pipeline.understanding.models import DocumentDigest
+from presentation_pipeline.retrieval.models import CandidateEvidenceSet
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +25,7 @@ class PresentationPlanningResult:
     digests: tuple[DocumentDigest, ...]
     selection: EvidenceSelection
     outline: PresentationOutline
+    candidates: CandidateEvidenceSet | None = None
 
     def __post_init__(self) -> None:
         """Reject manually assembled plans whose document stages no longer align."""
