@@ -51,20 +51,28 @@ async def generate_presentation_outline(
     lookup: "CorpusLookup | None" = None,
     retry_invalid_references: bool = True,
 ) -> PresentationOutline:
-    """Generate and validate once, with one unmodified-output repair retry."""
+    """Generate and validate once, with at most one full regeneration retry."""
+    from presentation_pipeline.validation import (
+        OutlineRequirementsValidationError,
+        ProvenanceValidationError,
+        validate_outline_requirements,
+        validate_presentation_outline,
+    )
+
+    def validate(outline: PresentationOutline) -> None:
+        if lookup is not None:
+            validate_presentation_outline(outline, lookup)
+        validate_outline_requirements(outline, requirements)
+
     outline = await invoke_structured(
         generator,
         OUTLINE_PROMPT,
         build_outline_input(digests, requirements, selection, indexes),
         PresentationOutline,
     )
-    if lookup is None:
-        return outline
-    from presentation_pipeline.validation import ProvenanceValidationError, validate_presentation_outline
-
     try:
-        validate_presentation_outline(outline, lookup)
-    except ProvenanceValidationError as error:
+        validate(outline)
+    except (ProvenanceValidationError, OutlineRequirementsValidationError) as error:
         if not retry_invalid_references:
             raise
         outline = await invoke_structured(
@@ -73,5 +81,5 @@ async def generate_presentation_outline(
             build_outline_input(digests, requirements, selection, indexes),
             PresentationOutline,
         )
-        validate_presentation_outline(outline, lookup)
+        validate(outline)
     return outline
