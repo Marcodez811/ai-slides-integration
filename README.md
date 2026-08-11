@@ -80,6 +80,18 @@ sections and slides, recommended content forms, and evidence IDs that remain
 traceable to the source corpus. It is the hand-off artifact for the future
 slide-rendering stage; it is not a PPTX file.
 
+### Semantic slide-content synthesis
+
+After planning, deterministic slide contexts resolve each slide's selected
+evidence into provider-safe semantic inputs. `generate_slide_contents()` then
+creates validated `SlideContent` objects (text, lists, and source references
+for charts, tables, images, and equations), without coordinates, styles, or
+PPTX rendering. `PresentationContent` preserves exact outline order and can be
+persisted with `write_presentation_content_json()` using the same explicit,
+UTF-8, sorted-key, no-overwrite semantics as outline artifacts. The synthesis
+live test is opt-in and requires both `OPENAI_API_KEY` and
+`RUN_OPENAI_INTEGRATION_TESTS=1`.
+
 The real provider smoke test is intentionally opt-in and is skipped in normal
 test runs (so it makes no network calls or model spend):
 
