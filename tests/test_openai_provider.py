@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from presentation_pipeline.budgeting import serialize_provider_input
 from presentation_pipeline.planning.models import (
     EvidenceSelection,
     OutlineSection,
@@ -124,12 +125,14 @@ def test_configures_store_and_preserves_deterministic_input_serialization() -> N
 
     call = client.responses.calls[0]
     assert call["store"] is True
-    assert call["input"] == json.dumps(
+    expected = json.dumps(
         {"a": {"b": True}, "z": ["漢字", 2]},
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     )
+    assert serialize_provider_input({"a": {"b": True}, "z": ["漢字", 2]}) == expected
+    assert call["input"] == expected
 
 
 @pytest.mark.parametrize("status", ["incomplete", "failed", "cancelled"])

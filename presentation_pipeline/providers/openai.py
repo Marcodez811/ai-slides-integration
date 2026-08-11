@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import inspect
-import json
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -11,6 +10,8 @@ from typing import Any, TypeVar
 
 from openai import AsyncOpenAI
 from pydantic import BaseModel
+
+from presentation_pipeline.budgeting.serialization import serialize_provider_input
 
 
 TStructured = TypeVar("TStructured", bound=BaseModel)
@@ -72,12 +73,7 @@ class OpenAIStructuredGenerator:
         Provider-state failures, refusals, and missing parsed output become a
         small controlled error type that callers can handle consistently.
         """
-        serialized_input = json.dumps(
-            input_data,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        serialized_input = serialize_provider_input(input_data)
         started = time.perf_counter()
         response: Any | None = None
         try:
