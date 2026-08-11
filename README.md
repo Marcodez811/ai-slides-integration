@@ -11,6 +11,44 @@ This repository contains a provenance-preserving DOCX pipeline. The new
 
 `docx_pipeline` is the canonical extraction interface and result contract.
 
+## Presentation planning pipeline
+
+`presentation_pipeline` builds on that immutable extraction result without
+changing `docx_pipeline`:
+
+```text
+DOCX files -> batch extraction -> deterministic document indexes
+           -> document digests -> cross-document evidence selection
+           -> presentation outline -> provenance validation
+```
+
+The deterministic index maps presentation-facing evidence IDs back to
+normalized block IDs and source node IDs. Tables can produce both table
+evidence and chart-candidate evidence. List text is reconstructed from its
+referenced source paragraphs, and images retain validated asset references.
+
+The LLM boundary is provider-neutral. Supply an implementation of
+`StructuredGenerator`; no OpenAI, Gemini, or Claude adapter is hardcoded:
+
+```python
+from presentation_pipeline import generate_outline
+from presentation_pipeline.planning import PresentationRequirements
+
+outline = await generate_outline(
+    ["financials.docx", "market.docx"],
+    PresentationRequirements(
+        goal="Explain quarterly performance",
+        audience="Executives",
+        target_slide_count=12,
+    ),
+    generator,
+)
+```
+
+Generated digest, selection, and outline references are rejected if they do
+not resolve through the document index to real normalized blocks, source
+nodes, and assets. Content and summary slides must cite evidence.
+
 ## Python API
 
 ```python

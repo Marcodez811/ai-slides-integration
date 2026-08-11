@@ -1,0 +1,22 @@
+"""Deterministic provenance checks for generated planning artifacts."""
+
+from .provenance import (
+    CorpusLookup,
+    ProvenanceValidationError,
+    validate_document_digests,
+    validate_evidence_selection,
+    validate_presentation_outline,
+)
+
+validate_digests = validate_document_digests
+validate_outline = validate_presentation_outline
+
+__all__ = [
+    "CorpusLookup",
+    "ProvenanceValidationError",
+    "validate_document_digests",
+    "validate_digests",
+    "validate_evidence_selection",
+    "validate_outline",
+    "validate_presentation_outline",
+]
