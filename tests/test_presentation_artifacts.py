@@ -6,13 +6,14 @@ import json
 
 import pytest
 
-from presentation_pipeline.artifacts import write_outline_json
+from presentation_pipeline.artifacts import write_outline_json, write_presentation_content_json
 from presentation_pipeline.planning.models import (
     OutlineSection,
     PresentationOutline,
     SlideOutline,
     SlidePurpose,
 )
+from presentation_pipeline.synthesis.models import PresentationContent, SlideContent
 
 
 def _outline() -> PresentationOutline:
@@ -66,3 +67,14 @@ def test_write_outline_json_is_pretty_deterministic_and_protects_existing_file(t
 def test_write_outline_json_requires_outline_model(tmp_path) -> None:
     with pytest.raises(TypeError, match="PresentationOutline"):
         write_outline_json({"title": "not validated"}, tmp_path / "outline.json")  # type: ignore[arg-type]
+
+
+def test_write_presentation_content_json_round_trips_and_protects_existing_file(tmp_path) -> None:
+    content = PresentationContent(slides=[SlideContent(slide_id="slide-1")])
+    output_path = write_presentation_content_json(content, tmp_path / "content.json")
+
+    assert PresentationContent.model_validate_json(output_path.read_text(encoding="utf-8")) == content
+    with pytest.raises(FileExistsError):
+        write_presentation_content_json(content, output_path)
+    with pytest.raises(TypeError, match="PresentationContent"):
+        write_presentation_content_json(_outline(), tmp_path / "wrong.json")  # type: ignore[arg-type]
