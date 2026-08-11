@@ -8,7 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from presentation_pipeline.pipeline import generate_outline
+from presentation_pipeline.pipeline import generate_outline, generate_plan
+from presentation_pipeline.results import PresentationPlanningResult
 from presentation_pipeline.planning.models import (
     EvidenceSelection,
     OutlineSection,
@@ -291,3 +292,101 @@ def test_end_to_end_orchestration_uses_deterministic_stages(monkeypatch) -> None
                 _PipelineGenerator(),
             )
         )
+
+
+def test_generate_plan_preserves_order_and_reusable_intermediates(monkeypatch) -> None:
+    import presentation_pipeline.pipeline as pipeline
+
+    artifact_a, artifact_b = _artifact("doc-a"), _artifact("doc-b")
+    index_a, index_b = _index("doc-a"), _index("doc-b")
+    requirements = PresentationRequirements(goal="Explain", audience="Team", target_slide_count=1)
+    outline = PresentationOutline(
+        title="Deck",
+        objective="Explain",
+        narrative="Narrative",
+        sections=[OutlineSection(section_id="s", title="S", purpose="P", slides=[SlideOutline(slide_id="slide-1", title="T", purpose=SlidePurpose.TITLE, message="M")])],
+    )
+    digests = [DocumentDigest(doc_id="doc-a", summary="A"), DocumentDigest(doc_id="doc-b", summary="B")]
+    selection = EvidenceSelection(selected=[SelectedEvidence(doc_id="doc-a", evidence_id="evidence-doc-a", reason="A")])
+    calls = {"extract": 0, "index": 0}
+    monkeypatch.setattr(pipeline, "build_jobs", lambda paths: list(paths))
+    def extract(jobs, max_workers):
+        calls["extract"] += 1
+        return SimpleNamespace(documents=[artifact_a, artifact_b], failures=[])
+    def index(artifact):
+        calls["index"] += 1
+        return {"doc-a": index_a, "doc-b": index_b}[artifact.doc_id]
+    async def generate_digests(*args, **kwargs):
+        return digests
+    async def select(*args, **kwargs):
+        return selection
+    async def generate_outline_stage(*args, **kwargs):
+        return outline
+    monkeypatch.setattr(pipeline, "extract_batch", extract)
+    monkeypatch.setattr(pipeline, "build_document_index", index)
+    monkeypatch.setattr(pipeline, "generate_digests", generate_digests)
+    monkeypatch.setattr(pipeline, "select_evidence", select)
+    monkeypatch.setattr(pipeline, "generate_presentation_outline", generate_outline_stage)
+
+    result = asyncio.run(generate_plan(["a.docx", "b.docx"], requirements, _PipelineGenerator()))
+
+    assert isinstance(result, PresentationPlanningResult)
+    assert result.requirements is requirements
+    assert result.artifacts == (artifact_a, artifact_b)
+    assert result.indexes == (index_a, index_b)
+    assert result.digests == tuple(digests)
+    assert result.selection is selection
+    assert result.outline is outline
+    assert calls == {"extract": 1, "index": 2}
+
+
+def test_generate_outline_delegates_to_generate_plan_without_repeating_work(monkeypatch) -> None:
+    import presentation_pipeline.pipeline as pipeline
+
+    requirements = PresentationRequirements(goal="Explain", audience="Team", target_slide_count=1)
+    artifact, index = _artifact(), _index()
+    digest = DocumentDigest(doc_id="doc-a", summary="A")
+    outline = PresentationOutline(
+        title="Deck", objective="Explain", narrative="Narrative",
+        sections=[OutlineSection(section_id="s", title="S", purpose="P", slides=[SlideOutline(slide_id="slide-1", title="T", purpose=SlidePurpose.TITLE, message="M")])],
+    )
+    result = PresentationPlanningResult(
+        requirements=requirements,
+        artifacts=(artifact,), indexes=(index,), digests=(digest,),
+        selection=EvidenceSelection(selected=[SelectedEvidence(doc_id="doc-a", evidence_id="evidence-doc-a", reason="A")]),
+        outline=outline,
+    )
+    calls = 0
+    async def fake_generate_plan(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return result
+    monkeypatch.setattr(pipeline, "generate_plan", fake_generate_plan)
+
+    returned = asyncio.run(generate_outline(["source.docx"], requirements, _PipelineGenerator()))
+
+    assert returned is outline
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    ("artifacts", "indexes", "digests", "match"),
+    [
+        ((), (), (), "identical nonzero lengths"),
+        ((_artifact(),), (), (DocumentDigest(doc_id="doc-a", summary="A"),), "identical nonzero lengths"),
+        ((_artifact(),), (_index("doc-b"),), (DocumentDigest(doc_id="doc-a", summary="A"),), "matching doc_id order"),
+    ],
+)
+def test_planning_result_rejects_misaligned_document_stages(
+    artifacts, indexes, digests, match: str
+) -> None:
+    requirements = PresentationRequirements(goal="Explain", audience="Team", target_slide_count=1)
+    outline = PresentationOutline(
+        title="Deck", objective="Explain", narrative="Narrative",
+        sections=[OutlineSection(section_id="s", title="S", purpose="P", slides=[SlideOutline(slide_id="slide-1", title="T", purpose=SlidePurpose.TITLE, message="M")])],
+    )
+    selection = EvidenceSelection(
+        selected=[SelectedEvidence(doc_id="doc-a", evidence_id="evidence-doc-a", reason="A")]
+    )
+    with pytest.raises(ValueError, match=match):
+        PresentationPlanningResult(requirements, artifacts, indexes, digests, selection, outline)
