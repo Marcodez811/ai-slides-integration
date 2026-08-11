@@ -27,8 +27,9 @@ normalized block IDs and source node IDs. Tables can produce both table
 evidence and chart-candidate evidence. List text is reconstructed from its
 referenced source paragraphs, and images retain validated asset references.
 
-The LLM boundary is provider-neutral. Supply an implementation of
-`StructuredGenerator`; no OpenAI, Gemini, or Claude adapter is hardcoded:
+The LLM boundary is provider-neutral. The orchestration code depends only on
+the `StructuredGenerator` contract, so a provider adapter can be substituted
+without changing extraction, indexing, planning, or provenance validation:
 
 ```python
 from presentation_pipeline import generate_outline
@@ -48,6 +49,70 @@ outline = await generate_outline(
 Generated digest, selection, and outline references are rejected if they do
 not resolve through the document index to real normalized blocks, source
 nodes, and assets. Content and summary slides must cite evidence.
+
+### Generate an outline with OpenAI
+
+The included OpenAI adapter is one implementation of that boundary. Install
+the project (including its OpenAI dependency), provide an API key, then run the
+example with one or more DOCX files:
+
+```bash
+uv sync --group dev
+
+OPENAI_API_KEY=... uv run python examples/generate_outline_openai.py \
+  briefing.docx \
+  --goal "Brief leadership on quarterly results" \
+  --audience "Leadership team" \
+  --slides 3 \
+  --tone executive \
+  --output output/outline.json
+```
+
+`OPENAI_MODEL` is optional and defaults to `gpt-5.6-terra`; set it to choose a
+different compatible OpenAI model. The command never prints document text. It
+writes a UTF-8, pretty, deterministic JSON representation of the validated
+`PresentationOutline`. Output paths are explicit, their parent directories are
+created as needed, and an existing file is protected unless `--overwrite` is
+provided.
+
+The generated JSON contains the deck title, objective, narrative, ordered
+sections and slides, recommended content forms, and evidence IDs that remain
+traceable to the source corpus. It is the hand-off artifact for the future
+slide-rendering stage; it is not a PPTX file.
+
+The real provider smoke test is intentionally opt-in and is skipped in normal
+test runs (so it makes no network calls or model spend):
+
+```bash
+OPENAI_API_KEY=... RUN_OPENAI_INTEGRATION_TESTS=1 \
+  uv run pytest -q tests/integration/test_openai_outline_live.py
+```
+
+For the locally supplied, gitignored `docs/*.docx` corpus, first run the
+deterministic extraction/index/provenance audit. This makes no OpenAI calls and
+writes `output/openai-docs-corpus/deterministic-report.json`:
+
+```bash
+RUN_DOCS_CORPUS_TESTS=1 \
+  uv run pytest -q -s \
+  tests/integration/test_openai_docs_corpus_live.py::test_docs_corpus_extracts_indexes_and_preserves_provenance
+```
+
+Then smoke-test the smallest real document with credentials loaded from the
+local `.env` file:
+
+```bash
+RUN_OPENAI_INTEGRATION_TESTS=1 OPENAI_DOCS_LIMIT=1 \
+  uv run --env-file .env pytest -q -s \
+  tests/integration/test_openai_docs_corpus_live.py::test_openai_generates_validated_outline_from_docs_corpus
+```
+
+Remove `OPENAI_DOCS_LIMIT=1` to evaluate all documents together as one corpus.
+The full run writes `outline.json` and `openai-report.json` beside the
+deterministic report. Optional overrides include `OPENAI_MODEL`,
+`OPENAI_DOCS_TARGET_SLIDES`, `OPENAI_DOCS_LLM_CONCURRENCY`, and
+`OPENAI_DOCS_OUTPUT_DIR`. Normal `uv run pytest` runs still skip both corpus
+tests and never read `.env` automatically.
 
 ## Python API
 

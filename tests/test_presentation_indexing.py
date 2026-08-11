@@ -198,6 +198,50 @@ def test_index_maps_supported_blocks_and_derives_chart_candidate():
     assert candidate.structured_data["series"] == [{"name": "Sales", "column": 1, "values": [1200.0, 1300.0]}]
 
 
+def test_index_accepts_tuple_nested_list_items_and_serializes_them_as_lists_without_mutation():
+    artifact = _artifact()
+    list_block = next(block for block in artifact.extraction.views.blocks if block.block_id == "block-list")
+    list_block.source_node_ids.append("node-2")
+    nested_item = list_block.payload["items"][0]["children"][0]
+    nested_item["children"] = (
+        {
+            "source_node_id": "node-2",
+            "level": 2,
+            "num_id": "7",
+            "ordered": False,
+            "marker": "•",
+            "children": (),
+        },
+    )
+    list_block.payload["items"][0]["children"] = (nested_item,)
+    before = deepcopy(list_block.payload)
+
+    first = build_document_index(artifact)
+    second = build_document_index(artifact)
+
+    first_items = next(item for item in first.evidence if item.kind is EvidenceKind.LIST).structured_data["items"]
+    second_items = next(item for item in second.evidence if item.kind is EvidenceKind.LIST).structured_data["items"]
+    assert first_items == second_items
+    assert isinstance(first_items, list)
+    assert isinstance(first_items[0]["children"], list)
+    assert isinstance(first_items[0]["children"][0]["children"], list)
+    assert first_items[0]["children"][0]["children"][0]["source_node_id"] == "node-2"
+    assert list_block.payload == before
+
+
+@pytest.mark.parametrize(
+    "children",
+    ["not-items", b"not-items", bytearray(b"not-items"), {"source_node_id": "node-6"}, 1, None],
+)
+def test_index_rejects_malformed_nested_list_child_containers(children):
+    artifact = _artifact()
+    list_block = next(block for block in artifact.extraction.views.blocks if block.block_id == "block-list")
+    list_block.payload["items"][0]["children"] = children
+
+    with pytest.raises(ValueError, match="malformed nested item children"):
+        build_document_index(artifact)
+
+
 def test_sections_preserve_view_membership_and_all_ids_resolve():
     index = build_document_index(_artifact())
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import asdict
 from typing import Iterable
 
 from ..config import ExtractionConfig
@@ -79,7 +78,7 @@ def build_normalized_views(
                 config,
                 {
                     "num_id": list_view.num_id,
-                    "items": [asdict(item) for item in list_view.items],
+                    "items": [_serialize_list_item(item) for item in list_view.items],
                 },
             )
         )
@@ -161,3 +160,27 @@ def _inline_content(nodes: Iterable[SourceNode]) -> str:
         elif kind == "tab":
             parts.append("\t")
     return "".join(parts)
+
+
+def _serialize_list_item(item: object) -> dict[str, object]:
+    """Return a JSON-shaped copy of an immutable ``ListItem`` tree.
+
+    ``ListItem.children`` is intentionally a tuple in the derived list view,
+    but normalized block payloads form a boundary consumed by JSON-oriented
+    pipeline stages.  Serialize only the public list-item fields here so that
+    every depth uses a mutable JSON array without changing the view objects.
+    """
+    # Import locally to keep the block builder's public dependency surface
+    # unchanged while retaining a concrete type for the recursive contract.
+    from .lists import ListItem
+
+    if not isinstance(item, ListItem):  # pragma: no cover - internal invariant
+        raise TypeError(f"expected ListItem, got {type(item).__name__}")
+    return {
+        "source_node_id": item.source_node_id,
+        "level": item.level,
+        "num_id": item.num_id,
+        "ordered": item.ordered,
+        "marker": item.marker,
+        "children": [_serialize_list_item(child) for child in item.children],
+    }

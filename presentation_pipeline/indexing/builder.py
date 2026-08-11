@@ -259,7 +259,17 @@ def _primary_evidence(
     payload = _payload(block)
     text: str | None = None
     asset_ids: list[str] = []
-    structured_data: dict[str, Any] = {"payload": _json_safe(payload)}
+    structured_data: dict[str, Any]
+    if kind is EvidenceKind.LIST:
+        # Validate the recursively nested structure before serializing the
+        # payload so malformed containers fail at the provenance boundary.
+        items = payload.get("items")
+        if not isinstance(items, list):
+            raise ValueError(f"list block {block.block_id!r} has malformed items payload")
+        _validate_list_items(items, block.block_id, source_ids, node_by_id)
+        structured_data = {"payload": _json_safe(payload), "items": _json_safe(items)}
+    else:
+        structured_data = {"payload": _json_safe(payload)}
     if kind in {EvidenceKind.TEXT, EvidenceKind.TITLE, EvidenceKind.CAPTION, EvidenceKind.TABLE, EvidenceKind.EQUATION}:
         content_key = "text" if kind is EvidenceKind.TABLE else "latex" if kind is EvidenceKind.EQUATION else "content"
         value = payload.get(content_key)
@@ -267,12 +277,7 @@ def _primary_evidence(
             raise ValueError(f"{kind.value} block {block.block_id!r} has non-string content")
         text = value
     elif kind is EvidenceKind.LIST:
-        items = payload.get("items")
-        if not isinstance(items, list):
-            raise ValueError(f"list block {block.block_id!r} has malformed items payload")
-        _validate_list_items(items, block.block_id, source_ids, node_by_id)
         text = _list_text(source_ids, node_by_id)
-        structured_data["items"] = _json_safe(items)
     elif kind is EvidenceKind.IMAGE:
         candidate_asset_id = payload.get("asset_id")
         if candidate_asset_id is not None:
@@ -342,7 +347,10 @@ def _validate_list_items(
         if _enum_value(node_by_id[source_node_id].kind) != SourceNodeKind.PARAGRAPH.value:
             raise ValueError(f"list block {block_id!r} item source {source_node_id!r} is not a paragraph")
         children = item.get("children", [])
-        if not isinstance(children, list):
+        if (
+            not isinstance(children, Sequence)
+            or isinstance(children, (str, bytes, bytearray, Mapping))
+        ):
             raise ValueError(f"list block {block_id!r} has malformed nested item children")
         _validate_list_items(children, block_id, block_source_ids, node_by_id)
 
