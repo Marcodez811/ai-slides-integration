@@ -8,6 +8,7 @@ from .provenance import (
     validate_presentation_outline,
 )
 from .requirements import OutlineRequirementsValidationError, validate_outline_requirements
+from .planning import OutlineEvidenceScopeValidationError, validate_outline_evidence_scope
 
 validate_digests = validate_document_digests
 validate_outline = validate_presentation_outline
@@ -16,10 +17,12 @@ __all__ = [
     "CorpusLookup",
     "ProvenanceValidationError",
     "OutlineRequirementsValidationError",
+    "OutlineEvidenceScopeValidationError",
     "validate_document_digests",
     "validate_digests",
     "validate_evidence_selection",
     "validate_outline",
     "validate_presentation_outline",
     "validate_outline_requirements",
+    "validate_outline_evidence_scope",
 ]

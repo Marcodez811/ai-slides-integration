@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from presentation_pipeline.understanding.models import DocumentDigest, StructuredGenerator
-from presentation_pipeline.understanding.service import invoke_structured
+from presentation_pipeline.generation import StructuredGenerator, invoke_structured
+from presentation_pipeline.understanding.models import DocumentDigest
 
 from .models import EvidenceSelection, PresentationOutline, PresentationRequirements
 from .prompts import (
@@ -49,12 +49,14 @@ async def generate_presentation_outline(
     generator: StructuredGenerator,
     *,
     lookup: "CorpusLookup | None" = None,
-    retry_invalid_references: bool = True,
+    retry_invalid_outline: bool = True,
 ) -> PresentationOutline:
     """Generate and validate once, with at most one full regeneration retry."""
     from presentation_pipeline.validation import (
         OutlineRequirementsValidationError,
+        OutlineEvidenceScopeValidationError,
         ProvenanceValidationError,
+        validate_outline_evidence_scope,
         validate_outline_requirements,
         validate_presentation_outline,
     )
@@ -62,6 +64,7 @@ async def generate_presentation_outline(
     def validate(outline: PresentationOutline) -> None:
         if lookup is not None:
             validate_presentation_outline(outline, lookup)
+        validate_outline_evidence_scope(outline, selection)
         validate_outline_requirements(outline, requirements)
 
     outline = await invoke_structured(
@@ -72,8 +75,12 @@ async def generate_presentation_outline(
     )
     try:
         validate(outline)
-    except (ProvenanceValidationError, OutlineRequirementsValidationError) as error:
-        if not retry_invalid_references:
+    except (
+        ProvenanceValidationError,
+        OutlineEvidenceScopeValidationError,
+        OutlineRequirementsValidationError,
+    ) as error:
+        if not retry_invalid_outline:
             raise
         outline = await invoke_structured(
             generator,

@@ -22,12 +22,15 @@ from presentation_pipeline.planning.prompts import (
 )
 from presentation_pipeline.planning.service import generate_presentation_outline
 from presentation_pipeline.understanding.models import DocumentDigest
+from presentation_pipeline.common.references import EvidenceRef
 from presentation_pipeline.understanding.prompts import (
     DOCUMENT_DIGEST_PROMPT,
     build_document_digest_input,
 )
 from presentation_pipeline.validation import (
     OutlineRequirementsValidationError,
+    OutlineEvidenceScopeValidationError,
+    validate_outline_evidence_scope,
     validate_outline_requirements,
 )
 
@@ -92,7 +95,7 @@ def _generate(outlines: list[PresentationOutline], *, retry: bool = True) -> tup
             EvidenceSelection(selected=[{"doc_id": "doc-a", "evidence_id": "evidence-a", "reason": "Reason"}]),
             [SimpleNamespace(doc_id="doc-a", evidence=[SimpleNamespace(evidence_id="evidence-a", kind="text", text="Text", section_ids=[], structured_data=None)])],
             generator,
-            retry_invalid_references=retry,
+            retry_invalid_outline=retry,
         )
     )
     return outline, generator
@@ -134,7 +137,113 @@ def test_requirement_failure_does_not_retry_when_retries_disabled() -> None:
                 EvidenceSelection(selected=[{"doc_id": "doc-a", "evidence_id": "evidence-a", "reason": "Reason"}]),
                 [SimpleNamespace(doc_id="doc-a", evidence=[SimpleNamespace(evidence_id="evidence-a", kind="text", text="Text", section_ids=[], structured_data=None)])],
                 generator,
-                retry_invalid_references=False,
+                retry_invalid_outline=False,
+            )
+        )
+    assert len(generator.prompts) == 1
+
+
+def _content_outline(evidence_id: str) -> PresentationOutline:
+    return PresentationOutline(
+        title="Deck",
+        objective="Explain",
+        narrative="Narrative",
+        sections=[
+            OutlineSection(
+                section_id="section-1",
+                title="Section",
+                purpose="Explain",
+                slides=[
+                    SlideOutline(
+                        slide_id="slide-1",
+                        title="Content",
+                        purpose=SlidePurpose.CONTENT,
+                        message="Message",
+                        evidence=[EvidenceRef(doc_id="doc-a", evidence_ids=[evidence_id])],
+                    )
+                ],
+            )
+        ],
+    )
+
+
+def _selected_evidence_index() -> SimpleNamespace:
+    return SimpleNamespace(
+        doc_id="doc-a",
+        evidence=[
+            SimpleNamespace(
+                evidence_id="evidence-a",
+                kind="text",
+                text="Text",
+                section_ids=[],
+                structured_data=None,
+            )
+        ],
+    )
+
+
+def test_outline_evidence_scope_accepts_selected_evidence() -> None:
+    selection = EvidenceSelection(
+        selected=[{"doc_id": "doc-a", "evidence_id": "evidence-a", "reason": "Reason"}]
+    )
+    validate_outline_evidence_scope(_content_outline("evidence-a"), selection)
+
+
+def test_outline_evidence_scope_rejects_real_but_unselected_evidence() -> None:
+    selection = EvidenceSelection(
+        selected=[{"doc_id": "doc-a", "evidence_id": "evidence-a", "reason": "Reason"}]
+    )
+    with pytest.raises(OutlineEvidenceScopeValidationError, match="unselected evidence"):
+        validate_outline_evidence_scope(_content_outline("evidence-b"), selection)
+
+
+def test_unselected_evidence_is_repaired_once() -> None:
+    generator = _OutlineSequenceGenerator(
+        [_content_outline("evidence-b"), _content_outline("evidence-a")]
+    )
+    result = asyncio.run(
+        generate_presentation_outline(
+            [DocumentDigest(doc_id="doc-a", summary="Summary")],
+            _requirements(1),
+            EvidenceSelection(selected=[{"doc_id": "doc-a", "evidence_id": "evidence-a", "reason": "Reason"}]),
+            [_selected_evidence_index()],
+            generator,
+        )
+    )
+    assert result == _content_outline("evidence-a")
+    assert len(generator.prompts) == 2
+    assert "VALIDATION_ERROR_TO_REPAIR" in generator.prompts[1]
+    assert "unselected evidence" in generator.prompts[1]
+
+
+def test_unselected_evidence_twice_propagates_second_validation_error() -> None:
+    generator = _OutlineSequenceGenerator(
+        [_content_outline("evidence-b"), _content_outline("evidence-c")]
+    )
+    with pytest.raises(OutlineEvidenceScopeValidationError, match="evidence-c"):
+        asyncio.run(
+            generate_presentation_outline(
+                [DocumentDigest(doc_id="doc-a", summary="Summary")],
+                _requirements(1),
+                EvidenceSelection(selected=[{"doc_id": "doc-a", "evidence_id": "evidence-a", "reason": "Reason"}]),
+                [_selected_evidence_index()],
+                generator,
+            )
+        )
+    assert len(generator.prompts) == 2
+
+
+def test_unselected_evidence_does_not_retry_when_disabled() -> None:
+    generator = _OutlineSequenceGenerator([_content_outline("evidence-b")])
+    with pytest.raises(OutlineEvidenceScopeValidationError, match="unselected evidence"):
+        asyncio.run(
+            generate_presentation_outline(
+                [DocumentDigest(doc_id="doc-a", summary="Summary")],
+                _requirements(1),
+                EvidenceSelection(selected=[{"doc_id": "doc-a", "evidence_id": "evidence-a", "reason": "Reason"}]),
+                [_selected_evidence_index()],
+                generator,
+                retry_invalid_outline=False,
             )
         )
     assert len(generator.prompts) == 1
