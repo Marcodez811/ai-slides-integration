@@ -68,7 +68,8 @@ def test_docs_corpus_extracts_indexes_and_preserves_provenance() -> None:
 
     from presentation_pipeline.corpus.batch import build_jobs, extract_batch
     from presentation_pipeline.indexing.builder import build_document_index
-    from presentation_pipeline.understanding.prompts import build_document_digest_input
+    from presentation_pipeline.budgeting import PlanningBudgets, Utf8ByteTokenEstimator
+    from presentation_pipeline.scale import document_window_diagnostics
     from presentation_pipeline.validation import CorpusLookup
 
     paths = _document_paths()
@@ -93,14 +94,8 @@ def test_docs_corpus_extracts_indexes_and_preserves_provenance() -> None:
         try:
             index = build_document_index(artifact)
             indexes.append(index)
-            provider_input = build_document_digest_input(artifact, index)
-            provider_chars = len(
-                json.dumps(
-                    provider_input,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
+            window_diagnostics = document_window_diagnostics(
+                artifact, index, token_counter=Utf8ByteTokenEstimator(), budgets=PlanningBudgets()
             )
             evidence_counts = Counter(item.kind.value for item in index.evidence)
         except Exception as error:
@@ -111,7 +106,7 @@ def test_docs_corpus_extracts_indexes_and_preserves_provenance() -> None:
                     "message": str(error),
                 }
             )
-            provider_chars = 0
+            window_diagnostics = {}
             evidence_counts = Counter()
 
         document_reports.append(
@@ -127,8 +122,7 @@ def test_docs_corpus_extracts_indexes_and_preserves_provenance() -> None:
                 "caption_links": len(extraction.views.caption_links),
                 "assets": len(extraction.assets),
                 "evidence_kinds": dict(sorted(evidence_counts.items())),
-                "provider_input_characters": provider_chars,
-                "provider_input_token_estimate": (provider_chars + 3) // 4,
+                **window_diagnostics,
                 "diagnostic_severities": dict(
                     sorted(
                         Counter(item.severity.value for item in extraction.diagnostics).items()
@@ -277,7 +271,7 @@ def test_openai_generates_validated_outline_from_docs_corpus() -> None:
     _write_report("openai-report.json", report)
 
     assert len(outline.all_slides()) == requirements.target_slide_count
-    assert response_models["DocumentDigest"] == len(paths)
+    assert response_models["ChunkDigest"] >= len(paths)
     assert response_models["EvidenceSelection"] == 1
     assert response_models["PresentationOutline"] in {1, 2}
     assert all(item.outcome == "success" for item in telemetry)
