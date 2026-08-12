@@ -119,7 +119,9 @@ class WindowedLLMEvidenceRetriever:
         local = await self._discover_windows(
             windows, digests_by_id, requirements, limiter
         )
-        candidates = _dedupe_candidates(local)
+        candidates = self._fit_selection_transport(
+            _dedupe_candidates(local), indexes, digests, requirements
+        )
         if not candidates:
             raise CandidateRetrievalError("candidate discovery returned no evidence")
         maximum = self._max_global_candidates()
@@ -130,6 +132,52 @@ class WindowedLLMEvidenceRetriever:
             if not candidates:
                 raise CandidateRetrievalError("candidate reduction returned no evidence")
         return CandidateEvidenceSet(candidates=candidates)
+
+    def _fit_selection_transport(
+        self,
+        candidates: list[CandidateEvidence],
+        indexes: Sequence[object],
+        digests: Sequence[DocumentDigest],
+        requirements: PresentationRequirements,
+    ) -> list[CandidateEvidence]:
+        """Greedily retain source-ordered slices that fit global selection.
+
+        Global selection chooses canonical evidence IDs, not slice IDs, so an
+        additional model call cannot usefully reduce a singleton candidate's
+        fragments.  This deterministic transport trim keeps input budgeting
+        strict without re-expanding the canonical item.
+        """
+        retained: list[CandidateEvidence] = []
+        for candidate in candidates:
+            contents = candidate.transport_contents()
+            if not contents:
+                retained.append(candidate)
+                continue
+            if len(contents) == 1:
+                # A singleton canonical candidate is handled by the existing
+                # candidate-reduction loop when the aggregate selector is too
+                # large. There are no additional slices to trim here.
+                retained.append(candidate)
+                continue
+            kept: list[dict[str, object]] = []
+            for content in contents:
+                proposed = candidate.with_transport_contents([*kept, content])
+                # Test the candidate's own transport against the stage. Other
+                # candidates are handled by the existing bounded reduction,
+                # rather than being silently stripped as a side effect of
+                # aggregate ordering.
+                if self._selection_fits([proposed], indexes, digests, requirements):
+                    kept.append(content)
+                elif not kept:
+                    raise CandidateRetrievalError(
+                        "one candidate transport slice cannot fit the evidence selection input budget"
+                    )
+            if not kept:
+                raise CandidateRetrievalError(
+                    "candidate transport has no fitting evidence selection slice"
+                )
+            retained.append(candidate.with_transport_contents(kept))
+        return retained
 
     def _discovery_transport_budget(
         self,
@@ -292,11 +340,9 @@ class WindowedLLMEvidenceRetriever:
                 (item.doc_id, item.evidence_id): item for item in group
             }
             return [
-                candidate.with_transport_content(
-                    source_by_identity[
-                        (candidate.doc_id, candidate.evidence_id)
-                    ].transport_content()
-                    or _compact_candidate(candidate, indexes)
+                candidate.with_transport_contents(
+                    source_by_identity[(candidate.doc_id, candidate.evidence_id)].transport_contents()
+                    or (_compact_candidate(candidate, indexes),)
                 )
                 for candidate in selection.candidates
             ]
@@ -357,9 +403,18 @@ class WindowedLLMEvidenceRetriever:
         indexes: Sequence[object],
         requirements: PresentationRequirements,
     ) -> list[list[CandidateEvidence]]:
+        # A canonical candidate can carry several independently bounded list
+        # fragments.  Keep them separate for prompt transport and, if their
+        # aggregate alone would exceed the reduction budget, retain the
+        # earliest fitting fragments rather than ever restoring canonical
+        # evidence.  Discovery is source ordered, so this is deterministic.
+        transport_safe = [
+            self._fit_candidate_transport(candidate, indexes, requirements)
+            for candidate in candidates
+        ]
         groups: list[list[CandidateEvidence]] = []
         current: list[CandidateEvidence] = []
-        for candidate in candidates:
+        for candidate in transport_safe:
             proposed = [*current, candidate]
             payload = build_candidate_reduction_input(requirements, proposed, indexes)
             if current and not self._fits(
@@ -380,6 +435,38 @@ class WindowedLLMEvidenceRetriever:
         if current:
             groups.append(current)
         return groups
+
+    def _fit_candidate_transport(
+        self,
+        candidate: CandidateEvidence,
+        indexes: Sequence[object],
+        requirements: PresentationRequirements,
+    ) -> CandidateEvidence:
+        contents = candidate.transport_contents()
+        if not contents:
+            return candidate
+        if len(contents) == 1:
+            payload = build_candidate_reduction_input(requirements, [candidate], indexes)
+            if not self._fits(payload, "candidate_reduction", CANDIDATE_REDUCTION_PROMPT):
+                raise CandidateRetrievalError(
+                    "one candidate transport slice cannot fit the candidate reduction input budget"
+                )
+            return candidate
+        kept: list[dict[str, object]] = []
+        for content in contents:
+            proposed = candidate.with_transport_contents([*kept, content])
+            payload = build_candidate_reduction_input(requirements, [proposed], indexes)
+            if self._fits(payload, "candidate_reduction", CANDIDATE_REDUCTION_PROMPT):
+                kept.append(content)
+            elif not kept:
+                raise CandidateRetrievalError(
+                    "one candidate transport slice cannot fit the candidate reduction input budget"
+                )
+        if not kept:
+            raise CandidateRetrievalError(
+                "candidate transport has no fitting candidate reduction slice"
+            )
+        return candidate.with_transport_contents(kept)
 
     async def _invoke(
         self,
@@ -493,7 +580,7 @@ def build_candidate_reduction_input(
 def _compact_candidate(
     candidate: CandidateEvidence, indexes: Sequence[object]
 ) -> dict[str, object]:
-    transport = candidate.transport_content()
+    transport = candidate.transport_payload()
     if transport is not None:
         return {
             "doc_id": candidate.doc_id,
@@ -516,14 +603,17 @@ def _compact_candidate(
 
 
 def _dedupe_candidates(candidates: Iterable[CandidateEvidence]) -> list[CandidateEvidence]:
-    seen: set[tuple[str, str]] = set()
-    result: list[CandidateEvidence] = []
+    by_identity: dict[tuple[str, str], CandidateEvidence] = {}
     for candidate in candidates:
         identity = (candidate.doc_id, candidate.evidence_id)
-        if identity not in seen:
-            seen.add(identity)
-            result.append(candidate)
-    return result
+        existing = by_identity.get(identity)
+        if existing is None:
+            by_identity[identity] = candidate
+        else:
+            by_identity[identity] = existing.with_transport_contents(
+                [*existing.transport_contents(), *candidate.transport_contents()]
+            )
+    return list(by_identity.values())
 
 
 def _positive_int(value: object, field: str) -> int:

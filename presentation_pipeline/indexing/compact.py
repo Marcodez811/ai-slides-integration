@@ -35,10 +35,33 @@ def compact_evidence_item(item: object) -> dict[str, object]:
         compact["text"] = text
     structured_data = getattr(item, "structured_data", None)
     if isinstance(structured_data, dict):
-        content = without_provenance_internals(structured_data)
+        content = (
+            _compact_list_content(structured_data)
+            if compact["kind"] == "list"
+            else without_provenance_internals(structured_data)
+        )
         if content:
             compact["content"] = content
     return compact
+
+
+def _compact_list_content(structured_data: dict[str, object]) -> dict[str, object]:
+    """Project canonical list structure once, without duplicated payload.items."""
+    cleaned = without_provenance_internals(structured_data)
+    if not isinstance(cleaned, dict):  # defensive for future normalizers
+        return {}
+    items = cleaned.get("items")
+    payload = cleaned.get("payload")
+    result = {key: value for key, value in cleaned.items() if key not in {"items", "payload"}}
+    if isinstance(payload, dict):
+        payload_metadata = {key: value for key, value in payload.items() if key != "items"}
+        if payload_metadata:
+            result["payload"] = payload_metadata
+        if items is None:
+            items = payload.get("items")
+    if isinstance(items, list):
+        result["items"] = items
+    return result
 
 
 def compact_sections(index: object) -> list[dict[str, object]]:

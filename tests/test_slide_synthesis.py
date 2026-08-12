@@ -154,6 +154,34 @@ def test_slide_context_uses_bounded_candidate_transport_content() -> None:
     assert context.evidence[0].structured_data == {"excerpt": "small"}
 
 
+def test_slide_context_merges_only_bounded_list_candidate_slices() -> None:
+    from types import SimpleNamespace
+
+    from presentation_pipeline.indexing.models import DocumentIndex, EvidenceItem
+    from presentation_pipeline.planning.models import EvidenceSelection, OutlineSection, PresentationOutline, SelectedEvidence
+    from presentation_pipeline.retrieval.models import CandidateEvidence, CandidateEvidenceSet
+    from presentation_pipeline.results import PresentationPlanningResult
+    from presentation_pipeline.understanding.models import DocumentDigest
+
+    canonical = [{"text": f"canonical-{number}", "children": []} for number in range(100)]
+    evidence = EvidenceItem(doc_id="doc-1", evidence_id="list-1", kind=EvidenceKind.LIST, text="\n".join(item["text"] for item in canonical), block_ids=["block-1"], section_ids=[], structured_data={"items": canonical}, asset_ids=[], source_node_ids=["node-1"])
+    candidate = CandidateEvidence(doc_id="doc-1", evidence_id="list-1", reason="selected").with_transport_contents([
+        {"evidence_id": "list-1", "kind": "list", "text": "chosen-first", "content": {"items": [{"text": "chosen-first", "children": []}]}, "slice": {"slice_id": "slice-0000", "index": 0, "count": 2}},
+        {"evidence_id": "list-1", "kind": "list", "text": "chosen-last", "content": {"items": [{"text": "chosen-last", "children": []}]}, "slice": {"slice_id": "slice-0001", "index": 1, "count": 2}},
+    ])
+    plan = PresentationPlanningResult(
+        requirements=SimpleNamespace(), artifacts=(SimpleNamespace(doc_id="doc-1"),),
+        indexes=(DocumentIndex(doc_id="doc-1", filename="doc.docx", extraction_schema_version="1", extractor_version="1", sections=[], evidence=[evidence]),), digests=(DocumentDigest(doc_id="doc-1", summary="digest"),),
+        selection=EvidenceSelection(selected=[SelectedEvidence(doc_id="doc-1", evidence_id="list-1", reason="selected")]),
+        outline=PresentationOutline(title="Deck", objective="Objective", narrative="Narrative", sections=[OutlineSection(section_id="s", title="Section", purpose="Purpose", slides=[SlideOutline(slide_id="slide-1", title="Title", purpose=SlidePurpose.CONTENT, message="Message", evidence=[EvidenceRef(doc_id="doc-1", evidence_ids=["list-1"])])])]),
+        candidates=CandidateEvidenceSet(candidates=[candidate]),
+    )
+    resolved = build_slide_contexts(plan)[0].evidence[0]
+    assert resolved.text == "chosen-first\nchosen-last"
+    assert resolved.structured_data == {"items": [{"text": "chosen-first", "children": []}, {"text": "chosen-last", "children": []}]}
+    assert "canonical-99" not in resolved.text
+
+
 class _Generator:
     def __init__(self) -> None:
         self.active = 0

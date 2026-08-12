@@ -49,7 +49,7 @@ def build_evidence_selection_input(
 
 
 def _compact_candidate_item(candidate: CandidateEvidence, indexes: list[object]) -> dict[str, object]:
-    transport = candidate.transport_content()
+    transport = candidate.transport_payload()
     if transport is not None:
         return {
             "doc_id": candidate.doc_id,
@@ -126,7 +126,7 @@ def _compact_selected_item(
     evidence_id = getattr(selection, "evidence_id", None)
     if not isinstance(doc_id, str) or not isinstance(evidence_id, str):
         raise ValueError("selected evidence is malformed")
-    transport = candidate.transport_content() if candidate is not None else None
+    transport = candidate.transport_payload() if candidate is not None else None
     if transport is not None:
         result = {"doc_id": doc_id, **transport}
         reason = getattr(selection, "reason", None)

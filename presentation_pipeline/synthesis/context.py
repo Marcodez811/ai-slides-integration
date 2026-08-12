@@ -242,7 +242,7 @@ def _resolve_slide_evidence(
                     f"slide {slide.slide_id!r} references unselected evidence {identity!r}"
                 )
             candidate = candidate_by_identity.get(identity) if candidate_by_identity is not None else None
-            transport = candidate.transport_content() if candidate is not None else None
+            transport = candidate.merged_transport_content() if candidate is not None else None
             resolved.append(_resolved_evidence(item, reason, transport))
     return resolved
 
