@@ -1,26 +1,23 @@
-"""Deterministic hierarchical reduction of bounded chunk digests."""
+"""Deterministic hierarchical reduction of already-bounded document digests."""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
+
 from presentation_pipeline.budgeting import InputBudget, TokenCounter, estimate_request_tokens
 from presentation_pipeline.observability import safe_debug, safe_event
 
 from .models import ChunkDigest, DigestFragment, DocumentDigest
-from .prompts import (
-    DIGEST_REDUCTION_PROMPT,
-    build_digest_compaction_input,
-    build_digest_reduction_input,
-)
+from .prompts import DIGEST_REDUCTION_PROMPT, build_digest_reduction_input
 
 
 class DigestProvenanceError(ValueError):
     """A digest cites evidence outside the input scope for its operation."""
 
 
-class ReductionNonReductionError(RuntimeError):
-    """A configured reduction cannot make deterministic forward progress."""
+class ReductionInvariantError(RuntimeError):
+    """Bounded fragments could not make deterministic forward progress."""
 
     def __init__(
         self,
@@ -29,44 +26,48 @@ class ReductionNonReductionError(RuntimeError):
         level: int,
         fragment_count: int,
         group_sizes: Sequence[int],
-        estimates: dict[str, object],
-        limit: int,
-        rounds: int,
+        fragment_token_estimates: Sequence[int] | None = None,
+        limit_tokens: int | None = None,
+        reason: str,
+        # Legacy diagnostic arguments retained only so old failure-report tests
+        # and persisted tooling can still construct the error. Production
+        # reduction no longer uses compaction.
+        estimates: dict[str, object] | None = None,
+        limit: int | None = None,
+        rounds: int | None = None,
         target_fragment_tokens: int | None = None,
         max_compaction_rounds: int | None = None,
-        reason: str,
     ) -> None:
-        # Diagnostics deliberately retain identifiers and numeric estimates only;
-        # fragment summaries and source evidence text must never reach errors.
-        fragment_estimates = list(estimates.get("fragment_tokens", ()))
+        if fragment_token_estimates is None:
+            raw = (estimates or {}).get("fragment_tokens", ())
+            fragment_token_estimates = [value for value in raw if isinstance(value, int)] if isinstance(raw, (list, tuple)) else []
+        if limit_tokens is None:
+            limit_tokens = limit if isinstance(limit, int) else 0
         self.metadata: dict[str, object] = {
             "doc_id": doc_id,
             "level": level,
             "fragment_count": fragment_count,
             "group_sizes": list(group_sizes),
-            "estimates": estimates,
-            "fragment_token_estimates": fragment_estimates,
-            "limit": limit,
-            "limit_tokens": limit,
-            "rounds": rounds,
-            "compaction_rounds": rounds,
-            "compaction_rounds_at_level": rounds,
+            "fragment_token_estimates": list(fragment_token_estimates),
+            "limit_tokens": limit_tokens,
             "reason": reason,
         }
+        if estimates is not None:
+            self.metadata["estimates"] = estimates
+        if rounds is not None:
+            self.metadata["rounds"] = rounds
+            self.metadata["compaction_rounds"] = rounds
+            self.metadata["compaction_rounds_at_level"] = rounds
         if target_fragment_tokens is not None:
             self.metadata["target_fragment_tokens"] = target_fragment_tokens
         if max_compaction_rounds is not None:
             self.metadata["max_compaction_rounds_per_level"] = max_compaction_rounds
-        super().__init__(f"reduction cannot make forward progress ({reason})")
+        super().__init__(f"reduction invariant violated ({reason})")
 
 
-class ReductionInvariantError(ReductionNonReductionError):
-    """Bounded digest fragments violated a reduction-tree invariant."""
-
-    def __init__(self, **kwargs: object) -> None:
-        super().__init__(**kwargs)  # type: ignore[arg-type]
-        keep = {"doc_id", "level", "fragment_count", "fragment_token_estimates", "group_sizes", "reason"}
-        self.metadata = {key: value for key, value in self.metadata.items() if key in keep}
+# Compatibility name used by failure reporting and older callers.  The
+# production reducer no longer has a compaction/retry state machine.
+ReductionNonReductionError = ReductionInvariantError
 
 
 def _limit(budget: InputBudget) -> int:
@@ -107,8 +108,7 @@ def validate_digest_scope(
     """Verify that a model response stays within the supplied provenance scope."""
     if digest.doc_id != doc_id:
         raise DigestProvenanceError("digest document ID does not match its input scope")
-    refs = digest.evidence_refs()
-    for reference in refs:
+    for reference in digest.evidence_refs():
         if reference.doc_id != doc_id:
             raise DigestProvenanceError("digest references evidence from another document")
         unknown = set(reference.evidence_ids) - allowed_evidence_ids
@@ -126,7 +126,6 @@ def _count(token_counter: TokenCounter, payload: dict[str, object]) -> int:
 def _fragment_token_estimates(
     fragments: Sequence[DigestFragment], token_counter: TokenCounter
 ) -> list[int]:
-    """Count canonical serialized fragment transport data, not source text."""
     estimates: list[int] = []
     for fragment in fragments:
         value = token_counter.count_payload(_fragment_input(fragment))
@@ -143,74 +142,15 @@ def target_fragment_tokens_for_pairing(
     token_counter: TokenCounter,
     budget: InputBudget,
 ) -> int:
-    """Derive a conservative pairable fragment target from the actual request shape."""
-    limit = _limit(budget)
+    """Compatibility diagnostic for the old reducer tests/tools.
+
+    Production output sizing is now controlled by DigestOutputContract.
+    """
     wrapper_tokens = _count(
         token_counter,
         build_digest_reduction_input(doc_id=doc_id, level=level, fragments=[]),
     )
-    return max(int(max(limit - wrapper_tokens, 1) * 0.45), 1)
-
-
-def _diagnostic_estimates(
-    fragments: Sequence[DigestFragment],
-    groups: Sequence[Sequence[DigestFragment]],
-    *,
-    token_counter: TokenCounter,
-    doc_id: str,
-    level: int,
-) -> dict[str, object]:
-    fragment_tokens = _fragment_token_estimates(fragments, token_counter)
-    group_tokens = [
-        _count(
-            token_counter,
-            build_digest_reduction_input(
-                doc_id=doc_id,
-                level=level,
-                fragments=[_fragment_input(fragment) for fragment in group],
-            ),
-        )
-        for group in groups
-    ]
-    return {
-        "fragment_tokens": fragment_tokens,
-        "total_fragment_tokens": sum(fragment_tokens),
-        "group_tokens": group_tokens,
-    }
-
-
-def _non_reduction_error(
-    *,
-    doc_id: str,
-    level: int,
-    fragments: Sequence[DigestFragment],
-    groups: Sequence[Sequence[DigestFragment]],
-    token_counter: TokenCounter,
-    limit: int,
-    rounds: int,
-    reason: str,
-    estimates: dict[str, object] | None = None,
-    target_fragment_tokens: int | None = None,
-    max_compaction_rounds: int | None = None,
-) -> ReductionNonReductionError:
-    return ReductionNonReductionError(
-        doc_id=doc_id,
-        level=level,
-        fragment_count=len(fragments),
-        group_sizes=[len(group) for group in groups],
-        estimates=(
-            estimates
-            if estimates is not None
-            else _diagnostic_estimates(
-                fragments, groups, token_counter=token_counter, doc_id=doc_id, level=level
-            )
-        ),
-        limit=limit,
-        rounds=rounds,
-        reason=reason,
-        target_fragment_tokens=target_fragment_tokens,
-        max_compaction_rounds=max_compaction_rounds,
-    )
+    return max(int(max(_limit(budget) - wrapper_tokens, 1) * 0.32), 1)
 
 
 def pack_digest_fragments(
@@ -220,9 +160,10 @@ def pack_digest_fragments(
     level: int,
     token_counter: TokenCounter,
     budget: InputBudget,
-    rounds: int = 0,
+    rounds: int = 0,  # retained only for compatibility; intentionally unused
 ) -> list[list[DigestFragment]]:
-    """Pack source-order fragments into groups using the real reduction payload."""
+    """Greedily pack source-ordered fragments using the real request shape."""
+    del rounds
     if not fragments:
         raise ValueError("at least one fragment is required for reduction")
     limit = _limit(budget)
@@ -233,37 +174,39 @@ def pack_digest_fragments(
             raise DigestProvenanceError("cannot reduce fragments from different documents")
         candidate = [*current, fragment]
         payload = build_digest_reduction_input(
-            doc_id=doc_id, level=level, fragments=[_fragment_input(value) for value in candidate]
+            doc_id=doc_id,
+            level=level,
+            fragments=[_fragment_input(value) for value in candidate],
         )
         if _count(token_counter, payload) <= limit:
             current.append(fragment)
             continue
         if not current:
-            raise _non_reduction_error(
+            raise ReductionInvariantError(
                 doc_id=doc_id,
                 level=level,
-                fragments=fragments,
-                groups=groups,
-                token_counter=token_counter,
-                limit=limit,
-                rounds=rounds,
-                reason="fragment_exceeds_limit",
+                fragment_count=len(fragments),
+                group_sizes=[],
+                fragment_token_estimates=_fragment_token_estimates(fragments, token_counter),
+                limit_tokens=limit,
+                reason="bounded_fragment_exceeds_request_limit",
             )
         groups.append(current)
         current = [fragment]
-        payload = build_digest_reduction_input(
-            doc_id=doc_id, level=level, fragments=[_fragment_input(fragment)]
+        singleton = build_digest_reduction_input(
+            doc_id=doc_id,
+            level=level,
+            fragments=[_fragment_input(fragment)],
         )
-        if _count(token_counter, payload) > limit:
-            raise _non_reduction_error(
+        if _count(token_counter, singleton) > limit:
+            raise ReductionInvariantError(
                 doc_id=doc_id,
                 level=level,
-                fragments=fragments,
-                groups=[*groups, current],
-                token_counter=token_counter,
-                limit=limit,
-                rounds=rounds,
-                reason="fragment_exceeds_limit",
+                fragment_count=len(fragments),
+                group_sizes=[*(len(group) for group in groups), 1],
+                fragment_token_estimates=_fragment_token_estimates(fragments, token_counter),
+                limit_tokens=limit,
+                reason="bounded_fragment_exceeds_request_limit",
             )
     if current:
         groups.append(current)
@@ -283,26 +226,26 @@ async def reduce_chunk_digests(
     budget: InputBudget,
     invoke: ReductionCall,
     compact_invoke: ReductionCall | None = None,
-    max_compaction_rounds: int = 2,
-    digest_contract_tokens: int | None = None,
+    max_compaction_rounds: int = 0,
 ) -> DocumentDigest:
-    """Recursively reduce chunks, with strict scope validation at every level."""
+    """Reduce bounded chunks without provider-based shrink/retry loops.
+
+    ``compact_invoke`` and ``max_compaction_rounds`` remain accepted only so
+    older callers do not crash at import/call time; they are intentionally
+    ignored.  All production digest outputs are bounded before they enter this
+    reducer.
+    """
+    del compact_invoke, max_compaction_rounds
     if not chunks:
         raise ValueError("cannot generate a document digest from empty evidence")
-    # Retained only as a compatibility signature. Production never supplies it:
-    # bounded output contracts make iterative compaction an invalid recovery.
-    if (
-        isinstance(max_compaction_rounds, bool)
-        or not isinstance(max_compaction_rounds, int)
-        or max_compaction_rounds < 0
-    ):
-        raise ValueError("max_compaction_rounds must be a non-negative integer")
     doc_id = chunks[0].doc_id
-    for ordinal, chunk in enumerate(chunks):
+    for chunk in chunks:
         if chunk.doc_id != doc_id:
             raise DigestProvenanceError("cannot reduce chunks from different documents")
+
     current = [fragment_from_chunk(chunk, ordinal) for ordinal, chunk in enumerate(chunks)]
     level = 0
+
     while True:
         groups = pack_digest_fragments(
             current,
@@ -310,22 +253,18 @@ async def reduce_chunk_digests(
             level=level,
             token_counter=token_counter,
             budget=budget,
-            rounds=0,
         )
-        fragment_estimates = _fragment_token_estimates(current, token_counter)
-        target_tokens = target_fragment_tokens_for_pairing(
-            doc_id=doc_id, level=level, token_counter=token_counter, budget=budget
-        )
+        estimates = _fragment_token_estimates(current, token_counter)
         adjacent = [
             _count(
                 token_counter,
                 build_digest_reduction_input(
                     doc_id=doc_id,
                     level=level,
-                    fragments=[_fragment_input(current[index]), _fragment_input(current[index + 1])],
+                    fragments=[_fragment_input(current[i]), _fragment_input(current[i + 1])],
                 ),
             )
-            for index in range(len(current) - 1)
+            for i in range(len(current) - 1)
         ]
         safe_event(
             "digest_reduction_level",
@@ -334,90 +273,127 @@ async def reduce_chunk_digests(
             fragment_count=len(current),
             group_count=len(groups),
             group_sizes=[len(group) for group in groups],
-            fragment_token_estimates=fragment_estimates,
+            fragment_token_estimates=estimates,
             input_limit_tokens=_limit(budget),
-            target_fragment_tokens=target_tokens,
-            adjacent_pair_count=len(adjacent),
-            adjacent_pair_fit_count=sum(tokens <= _limit(budget) for tokens in adjacent),
+            adjacent_pair_fit_count=sum(value <= _limit(budget) for value in adjacent),
         )
         safe_debug(
             "digest_reduction_pair_fit",
             doc_id=doc_id,
             level=level,
             adjacent_pair_tokens=[
-                {"left": index, "right": index + 1, "tokens": tokens, "fits": tokens <= _limit(budget)}
-                for index, tokens in enumerate(adjacent)
+                {"left": i, "right": i + 1, "tokens": value, "fits": value <= _limit(budget)}
+                for i, value in enumerate(adjacent)
             ],
         )
-        # A final response must be checked against the same full request shape.
+
         if len(groups) == 1:
             safe_event(
-                "reduction_decision", doc_id=doc_id, level=level, decision="final_reduce",
-                reason="all_fragments_fit", fragment_count=len(current), group_count=1,
+                "reduction_decision",
+                doc_id=doc_id,
+                level=level,
+                decision="final_reduce",
+                reason="all_fragments_fit",
+                fragment_count=len(current),
             )
             payload = build_digest_reduction_input(
-                doc_id=doc_id, level=level, fragments=[_fragment_input(value) for value in current]
+                doc_id=doc_id,
+                level=level,
+                fragments=[_fragment_input(value) for value in current],
             )
             result = await invoke(payload, DocumentDigest)
             if not isinstance(result, DocumentDigest):
                 raise TypeError("final reduction did not return a DocumentDigest")
-            validate_digest_scope(result, doc_id=doc_id, allowed_evidence_ids=evidence_scope(current))
-            return result
-        if len(groups) >= len(current):
-            error = ReductionInvariantError(
-                doc_id=doc_id, level=level, fragment_count=len(current),
-                group_sizes=[len(group) for group in groups],
-                estimates=_diagnostic_estimates(current, groups, token_counter=token_counter, doc_id=doc_id, level=level),
-                limit=_limit(budget), rounds=0, reason="singleton_group_deadlock",
+            validate_digest_scope(
+                result,
+                doc_id=doc_id,
+                allowed_evidence_ids=evidence_scope(current),
             )
-            error.metadata.update({
-                "fragment_token_estimates": fragment_estimates,
-                "input_limit_tokens": _limit(budget),
-                "digest_contract_tokens": digest_contract_tokens,
-            })
-            safe_event("reduction_invariant_failed", **error.metadata)
-            raise error
+            return result
+
+        if len(groups) >= len(current):
+            safe_event(
+                "reduction_invariant_failed",
+                doc_id=doc_id,
+                level=level,
+                fragment_count=len(current),
+                group_sizes=[len(group) for group in groups],
+                reason="bounded_fragments_not_pairable",
+            )
+            raise ReductionInvariantError(
+                doc_id=doc_id,
+                level=level,
+                fragment_count=len(current),
+                group_sizes=[len(group) for group in groups],
+                fragment_token_estimates=estimates,
+                limit_tokens=_limit(budget),
+                reason="bounded_fragments_not_pairable",
+            )
+
+        safe_event(
+            "reduction_decision",
+            doc_id=doc_id,
+            level=level,
+            decision="merge_groups",
+            reason="fragment_count_will_decrease",
+            fragment_count=len(current),
+            group_count=len(groups),
+        )
 
         async def reduce_group(ordinal: int, group: list[DigestFragment]) -> DigestFragment:
             if len(group) == 1:
                 fragment = group[0]
-                if fragment.doc_id != doc_id:
-                    raise DigestProvenanceError("singleton reduction fragment has another document ID")
                 safe_event(
                     "reduction_singleton_carried_forward",
                     doc_id=doc_id,
                     level=level,
                     group_ordinal=ordinal,
-                    fragment_id=fragment.fragment_id,
                     estimated_tokens=_fragment_token_estimates([fragment], token_counter)[0],
                 )
-                return fragment.model_copy(update={"fragment_id": f"fragment-l{level + 1}-{ordinal:04d}"})
+                return fragment.model_copy(
+                    update={"fragment_id": f"fragment-l{level + 1}-{ordinal:04d}"}
+                )
+
             payload = build_digest_reduction_input(
-                doc_id=doc_id, level=level, fragments=[_fragment_input(value) for value in group]
+                doc_id=doc_id,
+                level=level,
+                fragments=[_fragment_input(value) for value in group],
             )
             result = await invoke(payload, DigestFragment)
             if not isinstance(result, DigestFragment):
                 raise TypeError("intermediate reduction did not return a DigestFragment")
-            # Model-visible fragment IDs must be transport IDs, never citations.
-            result = result.model_copy(update={"fragment_id": f"fragment-l{level + 1}-{ordinal:04d}"})
-            validate_digest_scope(result, doc_id=doc_id, allowed_evidence_ids=evidence_scope(group))
-            input_tokens = _count(token_counter, payload)
-            merged_tokens = _fragment_token_estimates([result], token_counter)[0]
+            result = result.model_copy(
+                update={"fragment_id": f"fragment-l{level + 1}-{ordinal:04d}"}
+            )
+            validate_digest_scope(
+                result,
+                doc_id=doc_id,
+                allowed_evidence_ids=evidence_scope(group),
+            )
             safe_event(
                 "digest_reduction_merge",
                 doc_id=doc_id,
                 level=level,
                 group_ordinal=ordinal,
-                input_group_tokens=input_tokens,
-                merged_fragment_tokens=merged_tokens,
-                compression_ratio=(merged_tokens / input_tokens) if input_tokens else 1.0,
-                target_pairable_tokens=target_tokens,
+                input_group_tokens=_count(token_counter, payload),
+                merged_fragment_tokens=_fragment_token_estimates([result], token_counter)[0],
             )
             return result
 
-        safe_event(
-            "reduction_decision", doc_id=doc_id, level=level, decision="merge_groups",
-            reason="at_least_one_pair_fits", fragment_count=len(current), group_count=len(groups),
+        next_level = list(
+            await asyncio.gather(
+                *(reduce_group(ordinal, group) for ordinal, group in enumerate(groups))
+            )
         )
-        current = list(await asyncio.gather(*(reduce_group(ordinal, group) for ordinal, group in enumerate(groups))))
+        if len(next_level) >= len(current):
+            raise ReductionInvariantError(
+                doc_id=doc_id,
+                level=level,
+                fragment_count=len(current),
+                group_sizes=[len(group) for group in groups],
+                fragment_token_estimates=estimates,
+                limit_tokens=_limit(budget),
+                reason="merge_did_not_reduce_fragment_count",
+            )
+        current = next_level
         level += 1

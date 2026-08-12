@@ -1,76 +1,155 @@
-"""One-shot bounded digest generation with exactly one safe repair."""
+"""Bounded generation helpers for document-understanding digests."""
+
 from __future__ import annotations
 
 from typing import TypeVar
 
 from presentation_pipeline.budgeting import GenerationLimiter, InputBudget
+from presentation_pipeline.common.references import EvidenceRef
 from presentation_pipeline.observability import safe_event
 
-from .contracts import DigestNode, DigestOutputContract, DigestOutputContractError, estimate_digest_transport_tokens, validate_digest_contract
-from .prompts import DIGEST_CONTRACT_REPAIR_PROMPT
-from .reduction import DigestProvenanceError, validate_digest_scope
+from .contracts import DigestOutputContract, bound_digest_to_contract
+from .models import ChunkDigest, DigestFragment, DocumentDigest, KeyFact, TopicDigest
+from .reduction import validate_digest_scope
 
-T = TypeVar("T", bound=DigestNode)
-
-
-async def generate_bounded_digest(*, limiter: GenerationLimiter, system_prompt: str,
-                                  input_data: dict[str, object], response_model: type[T], stage: str,
-                                  input_budget: InputBudget, output_contract: DigestOutputContract,
-                                  allowed_evidence_ids: set[str], expected_doc_id: str,
-                                  expected_window_id: str | None = None,
-                                  include_contract_in_payload: bool = True) -> T:
-    """Call once, validate fully, then repair exactly once without source input."""
-    payload = {**input_data, "output_contract": output_contract.provider_value()} if include_contract_in_payload else dict(input_data)
-    prompt = system_prompt if include_contract_in_payload else system_prompt + f"\nLIMIT:{output_contract.max_transport_tokens}/{output_contract.max_topics}/{output_contract.max_key_facts}"
-    initial = await limiter.invoke(system_prompt=prompt, input_data=payload, response_model=response_model,
-                                   budget=input_budget, stage=stage)
-    if not isinstance(initial, response_model):
-        raise TypeError(f"{stage} did not return {response_model.__name__}")
-    try:
-        return _validate(initial, response_model, stage, limiter, output_contract, allowed_evidence_ids,
-                         expected_doc_id, expected_window_id, False)
-    except DigestOutputContractError as violation:
-        safe_event("digest_contract_violation", **violation.metadata, window_id=expected_window_id)
-        safe_event("digest_contract_repair_start", **violation.metadata, window_id=expected_window_id)
-        repair_payload = {"digest": initial.model_dump(mode="json"), "output_contract": output_contract.provider_value()}
-        repaired = await limiter.invoke(system_prompt=DIGEST_CONTRACT_REPAIR_PROMPT, input_data=repair_payload,
-                                        response_model=response_model, budget=input_budget, stage="digest_contract_repair")
-        if not isinstance(repaired, response_model):
-            raise TypeError(f"{stage} repair did not return {response_model.__name__}")
-        try:
-            value = _validate(repaired, response_model, stage, limiter, output_contract, allowed_evidence_ids,
-                              expected_doc_id, expected_window_id, True)
-        except DigestOutputContractError as failure:
-            failure.metadata["original_reason"] = violation.metadata["reason"]
-            failure.metadata["reason"] = "repair_failed_contract"
-            safe_event("digest_contract_repair_failed", **failure.metadata, window_id=expected_window_id)
-            raise
-        safe_event("digest_contract_repair_success", doc_id=expected_doc_id, stage=stage,
-                   response_model=response_model.__name__, window_id=expected_window_id,
-                   estimated_transport_tokens=estimate_digest_transport_tokens(value, limiter.token_counter),
-                   target_tokens=output_contract.max_transport_tokens, repaired=True)
-        return value
+DigestT = TypeVar("DigestT", ChunkDigest, DigestFragment, DocumentDigest)
 
 
-def _validate(result: T, model: type[T], stage: str, limiter: GenerationLimiter,
-              contract: DigestOutputContract, allowed: set[str], doc_id: str,
-              window_id: str | None, repaired: bool) -> T:
-    tokens = estimate_digest_transport_tokens(result, limiter.token_counter)
-    def failure(reason: str) -> DigestOutputContractError:
-        return DigestOutputContractError(doc_id=doc_id, stage=stage, response_model=model.__name__,
-            estimated_transport_tokens=tokens, contract=contract, topic_count=len(result.topics),
-            key_fact_count=len(result.key_facts), repair_attempted=repaired, reason=reason)
-    if result.doc_id != doc_id:
-        raise failure("document_id_mismatch")
-    if window_id is not None and getattr(result, "window_id", None) != window_id:
-        raise failure("window_id_mismatch")
-    try:
-        validate_digest_scope(result, doc_id=doc_id, allowed_evidence_ids=allowed)
-    except DigestProvenanceError:
-        raise failure("provenance_outside_scope") from None
-    validate_digest_contract(result, contract=contract, token_counter=limiter.token_counter,
-                             stage=stage, repair_attempted=repaired)
-    safe_event("digest_contract_valid", doc_id=doc_id, stage=stage, response_model=model.__name__,
-               window_id=window_id, estimated_output_tokens=tokens, target_tokens=contract.max_transport_tokens,
-               topic_count=len(result.topics), key_fact_count=len(result.key_facts), repaired=repaired)
-    return result
+async def generate_bounded_digest(
+    *,
+    limiter: GenerationLimiter,
+    system_prompt: str,
+    input_data: dict[str, object],
+    response_model: type[DigestT],
+    input_budget: InputBudget,
+    output_contract: DigestOutputContract,
+    stage: str,
+    expected_doc_id: str,
+    allowed_evidence_ids: set[str] | None = None,
+    expected_window_id: str | None = None,
+) -> DigestT:
+    """Generate once, normalize deterministic provenance, then bound output.
+
+    Document/window identities are transport metadata owned by the pipeline, not
+    semantic choices for the model. Evidence IDs *are* model-selected, so they
+    are intersected with the operation's allowed scope. Unsupported topics or
+    facts are dropped rather than being assigned invented provenance.
+
+    There is intentionally no provider-based compaction/repair loop here. A
+    model may be verbose, but the reduction tree receives a predictably small,
+    scope-safe projection.
+    """
+    result = await limiter.invoke(
+        system_prompt=system_prompt,
+        input_data=input_data,
+        response_model=response_model,
+        budget=input_budget,
+        stage=stage,
+    )
+    normalized = _normalize_digest_scope(
+        result,
+        expected_doc_id=expected_doc_id,
+        expected_window_id=expected_window_id,
+        allowed_evidence_ids=allowed_evidence_ids,
+        stage=stage,
+    )
+    if allowed_evidence_ids is not None:
+        validate_digest_scope(
+            normalized,
+            doc_id=expected_doc_id,
+            allowed_evidence_ids=allowed_evidence_ids,
+        )
+    return bound_digest_to_contract(
+        normalized,
+        contract=output_contract,
+        token_counter=limiter.token_counter,
+        stage=stage,
+    )
+
+
+def _normalize_digest_scope(
+    result: DigestT,
+    *,
+    expected_doc_id: str,
+    expected_window_id: str | None,
+    allowed_evidence_ids: set[str] | None,
+    stage: str,
+) -> DigestT:
+    """Project provider output onto deterministic pipeline provenance.
+
+    The provider is allowed to select from supplied evidence IDs, but it does
+    not own document/window identity. Unknown evidence IDs are removed. A claim
+    with no remaining valid evidence is removed as unsupported.
+    """
+
+    normalized_topics: list[TopicDigest] = []
+    normalized_facts: list[KeyFact] = []
+    dropped_evidence_ids = 0
+    canonicalized_reference_doc_ids = 0
+    dropped_topics = 0
+    dropped_facts = 0
+
+    def normalize_refs(refs: list[EvidenceRef]) -> list[EvidenceRef]:
+        nonlocal dropped_evidence_ids, canonicalized_reference_doc_ids
+        normalized: list[EvidenceRef] = []
+        for ref in refs:
+            if ref.doc_id != expected_doc_id:
+                canonicalized_reference_doc_ids += 1
+            if allowed_evidence_ids is None:
+                kept_ids = list(ref.evidence_ids)
+            else:
+                kept_ids = [
+                    evidence_id
+                    for evidence_id in ref.evidence_ids
+                    if evidence_id in allowed_evidence_ids
+                ]
+                dropped_evidence_ids += len(ref.evidence_ids) - len(kept_ids)
+            if kept_ids:
+                normalized.append(
+                    EvidenceRef(doc_id=expected_doc_id, evidence_ids=kept_ids)
+                )
+        return normalized
+
+    for topic in result.topics:
+        refs = normalize_refs(topic.evidence)
+        if not refs:
+            dropped_topics += 1
+            continue
+        normalized_topics.append(topic.model_copy(update={"evidence": refs}))
+
+    for fact in result.key_facts:
+        refs = normalize_refs(fact.evidence)
+        if not refs:
+            dropped_facts += 1
+            continue
+        normalized_facts.append(fact.model_copy(update={"evidence": refs}))
+
+    updates: dict[str, object] = {
+        "doc_id": expected_doc_id,
+        "topics": normalized_topics,
+        "key_facts": normalized_facts,
+    }
+    identity_changed = result.doc_id != expected_doc_id
+    if isinstance(result, ChunkDigest) and expected_window_id is not None:
+        identity_changed = identity_changed or result.window_id != expected_window_id
+        updates["window_id"] = expected_window_id
+
+    if (
+        identity_changed
+        or canonicalized_reference_doc_ids
+        or dropped_evidence_ids
+        or dropped_topics
+        or dropped_facts
+    ):
+        safe_event(
+            "digest_provenance_normalized",
+            stage=stage,
+            doc_id=expected_doc_id,
+            top_level_identity_changed=identity_changed,
+            canonicalized_reference_doc_ids=canonicalized_reference_doc_ids,
+            dropped_unknown_evidence_ids=dropped_evidence_ids,
+            dropped_unsupported_topics=dropped_topics,
+            dropped_unsupported_key_facts=dropped_facts,
+        )
+
+    return result.model_copy(update=updates)  # type: ignore[return-value]

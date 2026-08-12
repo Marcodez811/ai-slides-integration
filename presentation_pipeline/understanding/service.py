@@ -8,7 +8,6 @@ from collections.abc import Iterable, Sequence
 
 from presentation_pipeline.budgeting import (
     GenerationLimiter,
-    InputBudget,
     TokenCounter,
     UnderstandingBudgets,
     Utf8ByteTokenEstimator,
@@ -16,15 +15,11 @@ from presentation_pipeline.budgeting import (
 from presentation_pipeline.generation import StructuredGenerator
 from presentation_pipeline.observability import safe_debug, safe_event
 
-from .contracts import digest_output_contract
+from .contracts import output_contract_for_reduction_budget
 from .generation import generate_bounded_digest
 from .models import ChunkDigest, DigestFragment, DocumentDigest
-from .prompts import (
-    CHUNK_DIGEST_PROMPT,
-    DIGEST_REDUCTION_PROMPT,
-    document_id,
-)
-from .reduction import reduce_chunk_digests, validate_digest_scope
+from .prompts import CHUNK_DIGEST_PROMPT, DIGEST_REDUCTION_PROMPT, document_id
+from .reduction import evidence_scope, reduce_chunk_digests
 from .windows import EvidenceWindow, build_evidence_windows
 
 
@@ -37,22 +32,20 @@ async def _generate_chunk_digest(
     *,
     limiter: GenerationLimiter,
     budget: object,
-    contract: object,
+    output_contract: object,
 ) -> ChunkDigest:
     digest = await generate_bounded_digest(
-        limiter=limiter, system_prompt=CHUNK_DIGEST_PROMPT, input_data=window.payload,
-        response_model=ChunkDigest, stage="document_chunk_digest", input_budget=budget,
-        output_contract=contract, allowed_evidence_ids=set(window.evidence_ids),
-        expected_doc_id=window.doc_id, expected_window_id=window.window_id,
+        limiter=limiter,
+        system_prompt=CHUNK_DIGEST_PROMPT,
+        input_data=window.payload,
+        response_model=ChunkDigest,
+        input_budget=budget,  # type: ignore[arg-type]
+        output_contract=output_contract,  # type: ignore[arg-type]
+        stage="document_chunk_digest",
+        expected_doc_id=window.doc_id,
+        expected_window_id=window.window_id,
+        allowed_evidence_ids=set(window.evidence_ids),
     )
-    if digest.doc_id != window.doc_id:
-        raise ChunkDigestValidationError("chunk digest document ID does not match its evidence window")
-    if digest.window_id != window.window_id:
-        raise ChunkDigestValidationError("chunk digest window ID does not match its evidence window")
-    try:
-        validate_digest_scope(digest, doc_id=window.doc_id, allowed_evidence_ids=set(window.evidence_ids))
-    except ValueError as error:
-        raise ChunkDigestValidationError("chunk digest cites evidence outside its window") from error
     digest_tokens = limiter.token_counter.count_payload(digest.model_dump(mode="json"))
     safe_debug(
         "chunk_digest_complete",
@@ -77,11 +70,7 @@ async def generate_document_digest(
     limiter: GenerationLimiter | None = None,
     concurrency: int = 4,
 ) -> DocumentDigest:
-    """Generate a document digest through bounded windows and reduction.
-
-    Direct callers receive finite conservative defaults; pipeline callers should
-    pass their shared limiter to bound all generation stages together.
-    """
+    """Generate one small navigation digest from bounded evidence windows."""
     if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
         raise ValueError("concurrency must be an integer of at least 1")
     budgets = budgets if budgets is not None else UnderstandingBudgets()
@@ -92,30 +81,24 @@ async def generate_document_digest(
         limiter = GenerationLimiter(generator, token_counter=token_counter, concurrency=concurrency)
     elif token_counter is not None and token_counter is not limiter.token_counter:
         raise ValueError("token_counter must match the shared generation limiter")
+
     counter = limiter.token_counter
-    contract = digest_output_contract(budgets.reduction)
+    output_contract = output_contract_for_reduction_budget(budgets.reduction)
     started = time.perf_counter()
     expected_doc_id = document_id(artifact)
     if getattr(index, "doc_id", None) != expected_doc_id:
         raise ValueError("artifact and index document IDs do not match")
-    # Reserve the provider-visible contract and compact instruction before
-    # packing source windows; never discover an over-budget chunk at invoke.
-    contract_overhead = counter.count_payload({"output_contract": contract.provider_value()}) + 80
-    window_limit = budgets.window.target_input_tokens_or_usable - contract_overhead
-    if window_limit < 1:
-        raise ValueError("chunk digest contract leaves no input budget")
+
     windows = build_evidence_windows(
-        artifact, index, token_counter=counter, budget=InputBudget(max_input_tokens=window_limit)
+        artifact, index, token_counter=counter, budget=budgets.window
     )
     safe_event(
         "document_digest_start",
         doc_id=expected_doc_id,
         filename=getattr(artifact, "filename", None),
         window_count=len(windows),
+        digest_contract_tokens=output_contract.max_transport_tokens,
     )
-    safe_event("digest_contract_target", doc_id=expected_doc_id,
-               target_tokens=contract.max_transport_tokens, max_topics=contract.max_topics,
-               max_key_facts=contract.max_key_facts)
     estimates = [window.estimated_tokens for window in windows]
     safe_event(
         "digest_windows",
@@ -133,10 +116,16 @@ async def generate_document_digest(
             evidence_count=len(window.evidence_ids),
             estimated_tokens=window.estimated_tokens,
         )
+
     chunks = list(
         await asyncio.gather(
             *(
-                _generate_chunk_digest(window, limiter=limiter, budget=budgets.window, contract=contract)
+                _generate_chunk_digest(
+                    window,
+                    limiter=limiter,
+                    budget=budgets.window,
+                    output_contract=output_contract,
+                )
                 for window in windows
             )
         )
@@ -146,20 +135,40 @@ async def generate_document_digest(
     async def reduce_invoke(
         payload: dict[str, object], response_model: type[DigestFragment | DocumentDigest]
     ) -> DigestFragment | DocumentDigest:
-        fragments = payload.get("fragments", [])
-        allowed = {
-            evidence_id for fragment in fragments if isinstance(fragment, dict)
-            for collection in (fragment.get("topics", []), fragment.get("key_facts", []))
-            if isinstance(collection, list)
-            for item in collection if isinstance(item, dict)
-            for ref in item.get("evidence", []) if isinstance(ref, dict)
-            for evidence_id in ref.get("evidence_ids", []) if isinstance(evidence_id, str)
-        }
+        fragments = payload.get("fragments")
+        allowed: set[str] = set()
+        if isinstance(fragments, list):
+            # The reducer performs the authoritative scope validation after the
+            # provider call. This set only enables the shared generation helper
+            # to reject obviously invented provenance before projection.
+            for fragment in fragments:
+                if not isinstance(fragment, dict):
+                    continue
+                for field in ("topics", "key_facts"):
+                    items = fragment.get(field)
+                    if not isinstance(items, list):
+                        continue
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        refs = item.get("evidence")
+                        if not isinstance(refs, list):
+                            continue
+                        for ref in refs:
+                            if isinstance(ref, dict) and isinstance(ref.get("evidence_ids"), list):
+                                allowed.update(
+                                    value for value in ref["evidence_ids"] if isinstance(value, str)
+                                )
         return await generate_bounded_digest(
-            limiter=limiter, system_prompt=DIGEST_REDUCTION_PROMPT, input_data=payload,
-            response_model=response_model, stage="document_digest_reduction", input_budget=budgets.reduction,
-            output_contract=contract, allowed_evidence_ids=allowed, expected_doc_id=expected_doc_id,
-            include_contract_in_payload=False,
+            limiter=limiter,
+            system_prompt=DIGEST_REDUCTION_PROMPT,
+            input_data=payload,
+            response_model=response_model,
+            input_budget=budgets.reduction,
+            output_contract=output_contract,
+            stage="document_digest_reduction",
+            expected_doc_id=expected_doc_id,
+            allowed_evidence_ids=allowed,
         )
 
     digest = await reduce_chunk_digests(
@@ -167,16 +176,17 @@ async def generate_document_digest(
         token_counter=counter,
         budget=budgets.reduction,
         invoke=reduce_invoke,
-        digest_contract_tokens=contract.max_transport_tokens,
     )
     if digest.doc_id != expected_doc_id:
         raise ValueError("digest document ID does not match artifact")
+
     safe_event(
         "document_digest_complete",
         doc_id=expected_doc_id,
         filename=getattr(artifact, "filename", None),
         window_count=len(windows),
         chunk_count=len(chunks),
+        digest_output_estimated_tokens=counter.count_payload(digest.model_dump(mode="json")),
         elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
     )
     return digest
@@ -204,11 +214,7 @@ async def generate_digests(
     limiter: GenerationLimiter | None = None,
     concurrency: int = 4,
 ) -> list[DocumentDigest]:
-    """Generate in parallel while retaining artifact input order.
-
-    The optional limiter is deliberately shared with higher stages by the
-    application layer; otherwise this function creates a finite local limiter.
-    """
+    """Generate in parallel while retaining artifact input order."""
     if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
         raise ValueError("concurrency must be an integer of at least 1")
     budgets = budgets if budgets is not None else UnderstandingBudgets()

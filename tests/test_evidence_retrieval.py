@@ -16,7 +16,8 @@ from presentation_pipeline.retrieval import (
     LocalCandidateSelection,
     WindowedLLMEvidenceRetriever,
 )
-from presentation_pipeline.understanding.models import DocumentDigest
+from presentation_pipeline.planning.models import EvidenceRef
+from presentation_pipeline.understanding.models import DocumentDigest, KeyFact, TopicDigest
 
 
 def _index(doc_id: str, count: int = 2) -> object:
@@ -195,23 +196,108 @@ def test_transport_trimming_fails_loudly_for_first_nonfitting_slice_and_keeps_la
     assert [item["text"] for item in retained[0].transport_contents()] == ["one"]
 
 
-@pytest.mark.parametrize(
-    ("candidates", "match"),
-    [
-        ([{"doc_id": "a", "evidence_id": "outside", "reason": "bad"}], "outside"),
-        ([
-            {"doc_id": "a", "evidence_id": "e-a-0", "reason": "one"},
-            {"doc_id": "a", "evidence_id": "e-a-1", "reason": "two"},
-        ], "exceeds"),
-    ],
-)
-def test_local_candidate_responses_reject_out_of_window_and_over_cap(candidates, match) -> None:
+def test_candidate_discovery_digest_context_strips_global_evidence_ids() -> None:
+    from presentation_pipeline.retrieval.windowed import build_local_candidate_input
+    from presentation_pipeline.understanding.windows import EvidenceWindow
+
+    digest = DocumentDigest(
+        doc_id="a",
+        summary="whole-document context",
+        topics=[
+            TopicDigest(
+                topic="global topic",
+                summary="topic summary",
+                evidence=[EvidenceRef(doc_id="a", evidence_ids=["outside-topic-id"])],
+            )
+        ],
+        key_facts=[
+            KeyFact(
+                claim="global fact",
+                evidence=[EvidenceRef(doc_id="a", evidence_ids=["outside-fact-id"])],
+            )
+        ],
+    )
+    window = EvidenceWindow(
+        doc_id="a", window_id="window-0000", ordinal=0,
+        evidence_ids=("e-a-0",),
+        payload={"evidence": [{"evidence_id": "e-a-0", "kind": "text", "text": "local"}]},
+        estimated_tokens=1,
+    )
+    payload = build_local_candidate_input(
+        PresentationRequirements(goal="brief", audience="team", target_slide_count=1),
+        digest, window,
+    )
+    rendered = repr(payload["document_digest"])
+    assert "whole-document context" in rendered
+    assert "global topic" in rendered
+    assert "global fact" in rendered
+    assert "outside-topic-id" not in rendered
+    assert "outside-fact-id" not in rendered
+    assert payload["evidence"][0]["evidence_id"] == "e-a-0"
+
+
+def test_local_candidate_response_filters_out_of_scope_but_keeps_valid() -> None:
+    candidates = [
+        {"doc_id": "a", "evidence_id": "outside", "reason": "bad"},
+        {"doc_id": "a", "evidence_id": "e-a-0", "reason": "good"},
+    ]
     budget = RetrievalBudget(
-        request_budget=InputBudget(2_000), reduction_budget=InputBudget(2_000), selection_budget=InputBudget(2_000),
-        max_candidates_per_window=1, max_global_candidates=2,
+        request_budget=InputBudget(2_000), reduction_budget=InputBudget(2_000),
+        selection_budget=InputBudget(2_000), max_candidates_per_window=2,
+        max_global_candidates=2,
     )
     retriever = WindowedLLMEvidenceRetriever(
-        _InvalidCandidateGenerator(candidates), token_counter=Utf8ByteTokenEstimator(), budget=budget, concurrency=1
+        _InvalidCandidateGenerator(candidates), token_counter=Utf8ByteTokenEstimator(),
+        budget=budget, concurrency=1,
     )
-    with pytest.raises(CandidateRetrievalError, match=match):
-        asyncio.run(retriever.retrieve([_index("a")], [DocumentDigest(doc_id="a", summary="digest")], PresentationRequirements(goal="brief", audience="team", target_slide_count=1)))
+    result = asyncio.run(
+        retriever.retrieve(
+            [_index("a")], [DocumentDigest(doc_id="a", summary="digest")],
+            PresentationRequirements(goal="brief", audience="team", target_slide_count=1),
+        )
+    )
+    assert [candidate.evidence_id for candidate in result.candidates] == ["e-a-0"]
+
+
+def test_local_candidate_response_caps_excess_without_failing() -> None:
+    candidates = [
+        {"doc_id": "a", "evidence_id": "e-a-0", "reason": "one"},
+        {"doc_id": "a", "evidence_id": "e-a-1", "reason": "two"},
+    ]
+    budget = RetrievalBudget(
+        request_budget=InputBudget(2_000), reduction_budget=InputBudget(2_000),
+        selection_budget=InputBudget(2_000), max_candidates_per_window=1,
+        max_global_candidates=2,
+    )
+    retriever = WindowedLLMEvidenceRetriever(
+        _InvalidCandidateGenerator(candidates), token_counter=Utf8ByteTokenEstimator(),
+        budget=budget, concurrency=1,
+    )
+    result = asyncio.run(
+        retriever.retrieve(
+            [_index("a")], [DocumentDigest(doc_id="a", summary="digest")],
+            PresentationRequirements(goal="brief", audience="team", target_slide_count=1),
+        )
+    )
+    assert [candidate.evidence_id for candidate in result.candidates] == ["e-a-0"]
+
+
+def test_all_invalid_local_candidates_fail_only_after_discovery_finishes() -> None:
+    budget = RetrievalBudget(
+        request_budget=InputBudget(2_000), reduction_budget=InputBudget(2_000),
+        selection_budget=InputBudget(2_000), max_candidates_per_window=2,
+        max_global_candidates=2,
+    )
+    retriever = WindowedLLMEvidenceRetriever(
+        _InvalidCandidateGenerator([
+            {"doc_id": "a", "evidence_id": "outside", "reason": "bad"}
+        ]),
+        token_counter=Utf8ByteTokenEstimator(), budget=budget, concurrency=1,
+    )
+    with pytest.raises(CandidateRetrievalError, match="returned no evidence"):
+        asyncio.run(
+            retriever.retrieve(
+                [_index("a")], [DocumentDigest(doc_id="a", summary="digest")],
+                PresentationRequirements(goal="brief", audience="team", target_slide_count=1),
+            )
+        )

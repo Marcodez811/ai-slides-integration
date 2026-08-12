@@ -75,7 +75,7 @@ def _default_window() -> InputBudget:
 
 
 def _default_stage() -> InputBudget:
-    return InputBudget(max_input_tokens=24_000, safety_margin_tokens=2_000)
+    return InputBudget(max_input_tokens=32_000, safety_margin_tokens=2_000)
 
 
 @dataclass(frozen=True, slots=True)
