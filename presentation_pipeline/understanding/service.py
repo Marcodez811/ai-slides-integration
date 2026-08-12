@@ -8,6 +8,7 @@ from collections.abc import Iterable, Sequence
 
 from presentation_pipeline.budgeting import (
     GenerationLimiter,
+    InputBudget,
     TokenCounter,
     UnderstandingBudgets,
     Utf8ByteTokenEstimator,
@@ -15,10 +16,11 @@ from presentation_pipeline.budgeting import (
 from presentation_pipeline.generation import StructuredGenerator
 from presentation_pipeline.observability import safe_debug, safe_event
 
+from .contracts import digest_output_contract
+from .generation import generate_bounded_digest
 from .models import ChunkDigest, DigestFragment, DocumentDigest
 from .prompts import (
     CHUNK_DIGEST_PROMPT,
-    DIGEST_COMPACTION_PROMPT,
     DIGEST_REDUCTION_PROMPT,
     document_id,
 )
@@ -35,13 +37,13 @@ async def _generate_chunk_digest(
     *,
     limiter: GenerationLimiter,
     budget: object,
+    contract: object,
 ) -> ChunkDigest:
-    digest = await limiter.invoke(
-        system_prompt=CHUNK_DIGEST_PROMPT,
-        input_data=window.payload,
-        response_model=ChunkDigest,
-        budget=budget,
-        stage="document_chunk_digest",
+    digest = await generate_bounded_digest(
+        limiter=limiter, system_prompt=CHUNK_DIGEST_PROMPT, input_data=window.payload,
+        response_model=ChunkDigest, stage="document_chunk_digest", input_budget=budget,
+        output_contract=contract, allowed_evidence_ids=set(window.evidence_ids),
+        expected_doc_id=window.doc_id, expected_window_id=window.window_id,
     )
     if digest.doc_id != window.doc_id:
         raise ChunkDigestValidationError("chunk digest document ID does not match its evidence window")
@@ -91,12 +93,19 @@ async def generate_document_digest(
     elif token_counter is not None and token_counter is not limiter.token_counter:
         raise ValueError("token_counter must match the shared generation limiter")
     counter = limiter.token_counter
+    contract = digest_output_contract(budgets.reduction)
     started = time.perf_counter()
     expected_doc_id = document_id(artifact)
     if getattr(index, "doc_id", None) != expected_doc_id:
         raise ValueError("artifact and index document IDs do not match")
+    # Reserve the provider-visible contract and compact instruction before
+    # packing source windows; never discover an over-budget chunk at invoke.
+    contract_overhead = counter.count_payload({"output_contract": contract.provider_value()}) + 80
+    window_limit = budgets.window.target_input_tokens_or_usable - contract_overhead
+    if window_limit < 1:
+        raise ValueError("chunk digest contract leaves no input budget")
     windows = build_evidence_windows(
-        artifact, index, token_counter=counter, budget=budgets.window
+        artifact, index, token_counter=counter, budget=InputBudget(max_input_tokens=window_limit)
     )
     safe_event(
         "document_digest_start",
@@ -104,6 +113,9 @@ async def generate_document_digest(
         filename=getattr(artifact, "filename", None),
         window_count=len(windows),
     )
+    safe_event("digest_contract_target", doc_id=expected_doc_id,
+               target_tokens=contract.max_transport_tokens, max_topics=contract.max_topics,
+               max_key_facts=contract.max_key_facts)
     estimates = [window.estimated_tokens for window in windows]
     safe_event(
         "digest_windows",
@@ -124,7 +136,7 @@ async def generate_document_digest(
     chunks = list(
         await asyncio.gather(
             *(
-                _generate_chunk_digest(window, limiter=limiter, budget=budgets.window)
+                _generate_chunk_digest(window, limiter=limiter, budget=budgets.window, contract=contract)
                 for window in windows
             )
         )
@@ -134,23 +146,20 @@ async def generate_document_digest(
     async def reduce_invoke(
         payload: dict[str, object], response_model: type[DigestFragment | DocumentDigest]
     ) -> DigestFragment | DocumentDigest:
-        return await limiter.invoke(
-            system_prompt=DIGEST_REDUCTION_PROMPT,
-            input_data=payload,
-            response_model=response_model,
-            budget=budgets.reduction,
-            stage="document_digest_reduction",
-        )
-
-    async def compact_invoke(
-        payload: dict[str, object], response_model: type[DigestFragment | DocumentDigest]
-    ) -> DigestFragment | DocumentDigest:
-        return await limiter.invoke(
-            system_prompt=DIGEST_COMPACTION_PROMPT,
-            input_data=payload,
-            response_model=response_model,
-            budget=budgets.reduction,
-            stage="document_digest_compaction",
+        fragments = payload.get("fragments", [])
+        allowed = {
+            evidence_id for fragment in fragments if isinstance(fragment, dict)
+            for collection in (fragment.get("topics", []), fragment.get("key_facts", []))
+            if isinstance(collection, list)
+            for item in collection if isinstance(item, dict)
+            for ref in item.get("evidence", []) if isinstance(ref, dict)
+            for evidence_id in ref.get("evidence_ids", []) if isinstance(evidence_id, str)
+        }
+        return await generate_bounded_digest(
+            limiter=limiter, system_prompt=DIGEST_REDUCTION_PROMPT, input_data=payload,
+            response_model=response_model, stage="document_digest_reduction", input_budget=budgets.reduction,
+            output_contract=contract, allowed_evidence_ids=allowed, expected_doc_id=expected_doc_id,
+            include_contract_in_payload=False,
         )
 
     digest = await reduce_chunk_digests(
@@ -158,7 +167,7 @@ async def generate_document_digest(
         token_counter=counter,
         budget=budgets.reduction,
         invoke=reduce_invoke,
-        compact_invoke=compact_invoke,
+        digest_contract_tokens=contract.max_transport_tokens,
     )
     if digest.doc_id != expected_doc_id:
         raise ValueError("digest document ID does not match artifact")

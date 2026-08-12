@@ -9,7 +9,7 @@ import pytest
 
 from presentation_pipeline.deck import DeckGenerationConfig, generate_deck
 from presentation_pipeline.budgeting import CharacterTokenEstimator, GenerationLimiter, InputBudget
-from presentation_pipeline.observability import configure_run_logging, console_formatter, run_metrics, telemetry_logger
+from presentation_pipeline.observability import configure_run_logging, console_formatter, run_metrics, safe_event, telemetry_logger
 from presentation_pipeline.planning import PresentationRequirements
 from pydantic import BaseModel
 
@@ -45,6 +45,17 @@ def test_console_run_summary_renders_values_not_only_metric_keys() -> None:
     assert "windows=5" in rendered
     assert "actual_input_tokens=120" in rendered
     assert "calls_by_stage={document_digest_reduction:2}" in rendered
+
+
+def test_digest_contract_metrics_count_repairs_and_failures(tmp_path) -> None:
+    configure_run_logging(output_dir=tmp_path / "deck", run_id="contracts")
+    safe_event("digest_contract_repair_start", doc_id="doc", stage="chunk")
+    safe_event("digest_contract_violation", doc_id="doc", stage="chunk")
+    safe_event("digest_contract_repair_failed", doc_id="doc", stage="chunk")
+    metrics = run_metrics()
+    assert metrics is not None
+    assert metrics.summary()["digest_contract_repairs"] == 1
+    assert metrics.summary()["digest_contract_failures"] == 2
 
 
 def test_task_local_estimate_to_actual_correlation_handles_concurrent_calls(tmp_path) -> None:

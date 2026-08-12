@@ -43,6 +43,8 @@ class RunMetrics:
         self.chunk_digest_count = 0
         self.semantic_slide_count = 0
         self.physical_slide_count = 0
+        self.digest_contract_repairs = 0
+        self.digest_contract_failures = 0
 
     def record_limiter_call(self, *, stage: str) -> None:
         self.calls_by_stage[stage] = self.calls_by_stage.get(stage, 0) + 1
@@ -77,6 +79,10 @@ class RunMetrics:
                 value = fields.get(key)
                 if isinstance(value, int) and value >= 0:
                     setattr(self, key, value)
+        elif event == "digest_contract_repair_start":
+            self.digest_contract_repairs += 1
+        elif event in {"digest_contract_violation", "digest_contract_repair_failed"}:
+            self.digest_contract_failures += 1
 
     def summary(self) -> dict[str, object]:
         ratios = sorted(self.estimated_to_actual_ratios)
@@ -89,6 +95,8 @@ class RunMetrics:
             "calls_by_stage": dict(self.calls_by_stage),
             "reduction_call_count": self.calls_by_stage.get("document_digest_reduction", 0),
             "compaction_call_count": self.calls_by_stage.get("document_digest_compaction", 0),
+            "digest_contract_repairs": self.digest_contract_repairs,
+            "digest_contract_failures": self.digest_contract_failures,
             "document_count": self.document_count,
             "window_count": self.window_count,
             "chunk_digest_count": self.chunk_digest_count,
