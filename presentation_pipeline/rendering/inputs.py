@@ -26,10 +26,11 @@ def resolve_render_inputs(
     embedded; an escaping path becomes a visible text fallback plus a warning.
     """
     diagnostics: list[RenderDiagnostic] = []
+    resolved_asset_root = Path(asset_root).resolve() if asset_root is not None else None
     resolved: list[ResolvedElement] = []
     for index, element in enumerate(elements):
         try:
-            result = _resolve_one(index, element, source_lookup or {}, asset_root, assets_by_doc or {}, source_filenames or {}, diagnostics, slide_id)
+            result = _resolve_one(index, element, source_lookup or {}, resolved_asset_root, assets_by_doc or {}, source_filenames or {}, diagnostics, slide_id)
         except Exception as error:
             diagnostics.append(_warning(slide_id, index, "RENDER_INPUT_INVALID", f"Could not resolve render input: {type(error).__name__}"))
             result = ResolvedElement(element_index=index, kind="text", text="Source content is unavailable.")
@@ -152,10 +153,12 @@ def _safe_path(value: str | Path | None, root: str | Path | None) -> Path | None
     candidate = Path(value)
     if root is None:
         return candidate.resolve()
-    root_path = Path(root).resolve()
+    root_path = root if isinstance(root, Path) else Path(root).resolve()
     candidate = candidate if candidate.is_absolute() else root_path / candidate
     try:
-        return candidate.resolve().relative_to(root_path) and candidate.resolve()
+        resolved = candidate.resolve()
+        resolved.relative_to(root_path)
+        return resolved
     except ValueError:
         return None
 

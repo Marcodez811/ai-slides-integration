@@ -1,6 +1,7 @@
 """Deterministic slide contexts and validated semantic slide content."""
 
 from .context import ResolvedEvidence, SlideContext, build_slide_contexts
+from .budgeting import SynthesisBudgets
 from .models import (
     BulletItem,
     BulletListContent,
@@ -18,6 +19,6 @@ from .validation import SlideContentValidationError, validate_presentation_conte
 __all__ = [
     "BulletItem", "BulletListContent", "ChartContent", "EquationContent", "ImageContent",
     "PresentationContent", "ResolvedEvidence", "SlideContent", "SlideContentValidationError",
-    "SlideContext", "TableContent", "TextContent", "build_presentation_content", "build_slide_contexts", "generate_slide_content",
+    "SlideContext", "SynthesisBudgets", "TableContent", "TextContent", "build_presentation_content", "build_slide_contexts", "generate_slide_content",
     "generate_slide_contents", "validate_presentation_content", "validate_slide_content",
 ]

@@ -197,7 +197,7 @@ def test_independent_verifier_rejects_missing_and_malformed_required_parts(tmp_p
 def test_cli_exposes_and_forwards_image_concurrency(monkeypatch, tmp_path) -> None:
     parsed = cli._parser().parse_args([
         "generate", "source.docx", "--goal", "Goal", "--audience", "Audience", "--slides", "2", "--output-dir", str(tmp_path),
-        "--generate-images", "--image-concurrency", "3",
+        "--generate-images", "--image-concurrency", "3", "--debug",
     ])
     received: dict[str, object] = {}
 
@@ -206,7 +206,15 @@ def test_cli_exposes_and_forwards_image_concurrency(monkeypatch, tmp_path) -> No
         return SimpleNamespace(pptx_path=tmp_path / "deck.pptx")
 
     monkeypatch.setattr(cli, "generate_deck", fake_generate_deck)
-    monkeypatch.setattr(cli, "OpenAIStructuredGenerator", lambda **_kwargs: object())
+    provider_kwargs: dict[str, object] = {}
+    def provider(**kwargs):
+        provider_kwargs.update(kwargs)
+        return object()
+    monkeypatch.setattr(cli, "OpenAIStructuredGenerator", provider)
     monkeypatch.setattr(cli, "OpenAIImageGenerator", lambda **_kwargs: object())
     assert asyncio.run(cli._run(parsed)) == tmp_path / "deck.pptx"
     assert received["config"].image_concurrency == 3
+    assert received["config"].keep_failed_artifacts
+    assert received["config"].run_id
+    assert received["config"].log_path
+    assert callable(provider_kwargs["telemetry_handler"])

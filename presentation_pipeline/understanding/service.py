@@ -12,9 +12,15 @@ from presentation_pipeline.budgeting import (
     Utf8ByteTokenEstimator,
 )
 from presentation_pipeline.generation import StructuredGenerator
+from presentation_pipeline.observability import safe_debug, safe_event
 
 from .models import ChunkDigest, DigestFragment, DocumentDigest
-from .prompts import CHUNK_DIGEST_PROMPT, DIGEST_REDUCTION_PROMPT, document_id
+from .prompts import (
+    CHUNK_DIGEST_PROMPT,
+    DIGEST_COMPACTION_PROMPT,
+    DIGEST_REDUCTION_PROMPT,
+    document_id,
+)
 from .reduction import reduce_chunk_digests, validate_digest_scope
 from .windows import EvidenceWindow, build_evidence_windows
 
@@ -44,6 +50,14 @@ async def _generate_chunk_digest(
         validate_digest_scope(digest, doc_id=window.doc_id, allowed_evidence_ids=set(window.evidence_ids))
     except ValueError as error:
         raise ChunkDigestValidationError("chunk digest cites evidence outside its window") from error
+    safe_debug(
+        "chunk_digest_complete",
+        doc_id=window.doc_id,
+        window_id=window.window_id,
+        topic_count=len(digest.topics),
+        key_fact_count=len(digest.key_facts),
+        estimated_digest_tokens=limiter.token_counter.count_payload(digest.model_dump(mode="json")),
+    )
     return digest
 
 
@@ -79,6 +93,23 @@ async def generate_document_digest(
     windows = build_evidence_windows(
         artifact, index, token_counter=counter, budget=budgets.window
     )
+    estimates = [window.estimated_tokens for window in windows]
+    safe_event(
+        "digest_windows",
+        doc_id=expected_doc_id,
+        window_count=len(windows),
+        max_window_token_estimate=max(estimates, default=0),
+        total_window_token_estimate=sum(estimates),
+    )
+    for window in windows:
+        safe_debug(
+            "digest_window",
+            doc_id=expected_doc_id,
+            window_id=window.window_id,
+            ordinal=window.ordinal,
+            evidence_count=len(window.evidence_ids),
+            estimated_tokens=window.estimated_tokens,
+        )
     chunks = list(
         await asyncio.gather(
             *(
@@ -87,6 +118,7 @@ async def generate_document_digest(
             )
         )
     )
+    safe_event("chunk_digests_complete", doc_id=expected_doc_id, chunk_count=len(chunks))
 
     async def reduce_invoke(
         payload: dict[str, object], response_model: type[DigestFragment | DocumentDigest]
@@ -99,8 +131,23 @@ async def generate_document_digest(
             stage="document_digest_reduction",
         )
 
+    async def compact_invoke(
+        payload: dict[str, object], response_model: type[DigestFragment | DocumentDigest]
+    ) -> DigestFragment | DocumentDigest:
+        return await limiter.invoke(
+            system_prompt=DIGEST_COMPACTION_PROMPT,
+            input_data=payload,
+            response_model=response_model,
+            budget=budgets.reduction,
+            stage="document_digest_compaction",
+        )
+
     digest = await reduce_chunk_digests(
-        chunks, token_counter=counter, budget=budgets.reduction, invoke=reduce_invoke
+        chunks,
+        token_counter=counter,
+        budget=budgets.reduction,
+        invoke=reduce_invoke,
+        compact_invoke=compact_invoke,
     )
     if digest.doc_id != expected_doc_id:
         raise ValueError("digest document ID does not match artifact")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from math import floor
+import unicodedata
 
 from presentation_pipeline.planning.models import SlidePurpose
 from presentation_pipeline.synthesis.context import SlideContext
@@ -90,6 +91,25 @@ def build_presentation_layout(
     return PresentationLayout(slides=slides, theme=active_theme)
 
 
+def text_width_units(text: str) -> float:
+    """Deterministic CJK-aware text width estimate for pagination decisions."""
+    width = 0.0
+    for character in text:
+        if character.isspace():
+            width += 0.30
+        elif unicodedata.east_asian_width(character) in {"W", "F"}:
+            width += 1.0
+        elif unicodedata.east_asian_width(character) == "A":
+            width += 0.92
+        elif character.isalnum():
+            width += 0.52
+        elif character in ".,;:!?()[]{}":
+            width += 0.42
+        else:
+            width += 0.62
+    return width
+
+
 def text_capacity(box: Box, font_size_pt: float, *, bullet: bool = False) -> int:
     """Conservative character capacity used for deterministic pagination diagnostics."""
     if font_size_pt <= 0:
@@ -115,9 +135,10 @@ def validate_layout(layout: PhysicalSlideLayout) -> list[RenderDiagnostic]:
                 diagnostics.append(_diagnostic("error", "font_limit", f"font size {element.font_size_pt:g}pt is outside permitted limits", layout, element))
             text = element.text or (element.payload.text if element.payload else None)
             items = element.items or (element.payload.items if element.payload else None)
-            if text and len(text) > text_capacity(box, element.font_size_pt):
+            capacity_units = text_capacity(box, element.font_size_pt) * 0.52
+            if text and text_width_units(text) > capacity_units:
                 diagnostics.append(_diagnostic("error", "text_capacity", "text exceeds its allocated box after pagination", layout, element))
-            if items and sum(len(item) + 2 for item in items) > text_capacity(box, element.font_size_pt, bullet=True):
+            if items and sum(text_width_units(item) + 0.6 for item in items) > text_capacity(box, element.font_size_pt, bullet=True) * 0.52:
                 diagnostics.append(_diagnostic("error", "text_capacity", "bullets exceed their allocated box after pagination", layout, element))
     for index, first in enumerate(layout.elements):
         for second in layout.elements[index + 1:]:
@@ -175,9 +196,9 @@ def _paginate_payloads(resolved: list[ResolvedElement]) -> list[list[ResolvedEle
                     text_page = []
     if text_page:
         units.append(text_page)
-    # A visual-text page intentionally combines its first source/decorative
-    # image with the following prose. Additional images stay on later pages.
-    if units and len(units[0]) == 1 and units[0][0].kind == "image":
+    # A visual-text page intentionally combines one visual with short prose.
+    # Keep charts/tables informative without introducing a layout solver.
+    if units and len(units[0]) == 1 and units[0][0].kind in {"image", "table", "chart"}:
         text_page_index = next((index for index, page in enumerate(units[1:], start=1) if all(item.kind not in {"image", "table", "chart"} for item in page)), None)
         if text_page_index is not None:
             units[0].extend(units.pop(text_page_index))
@@ -216,37 +237,20 @@ def _table_chunks(element: ResolvedElement) -> list[ResolvedElement]:
 
 
 def _split_text(value: str, limit: int) -> list[str]:
-    if len(value) <= limit:
+    if text_width_units(value) <= limit * 0.52:
         return [value]
-    import re
-
-    sentences = [part.strip() for part in re.findall(r".*?(?:[.!?。！？]+(?:\s+|$)|$)", value, flags=re.S) if part.strip()]
-    if not sentences:
-        sentences = [value]
+    sentences = _sentence_units(value)
     pieces: list[str] = []
     current = ""
     for sentence in sentences:
-        if len(sentence) > limit:
+        if text_width_units(sentence) > limit * 0.52:
             if current:
                 pieces.append(current)
                 current = ""
-            words = sentence.split()
-            if len(words) == 1 and len(words[0]) > limit:
-                pieces.extend(words[0][index:index + limit] for index in range(0, len(words[0]), limit))
-                continue
-            chunk = ""
-            for word in words:
-                candidate = f"{chunk} {word}".strip()
-                if chunk and len(candidate) > limit:
-                    pieces.append(chunk)
-                    chunk = word
-                else:
-                    chunk = candidate
-            if chunk:
-                pieces.append(chunk)
+            pieces.extend(_split_overlong(sentence, limit))
             continue
         candidate = f"{current} {sentence}".strip()
-        if current and len(candidate) > limit:
+        if current and text_width_units(candidate) > limit * 0.52:
             pieces.append(current)
             current = sentence
         else:
@@ -254,6 +258,59 @@ def _split_text(value: str, limit: int) -> list[str]:
     if current:
         pieces.append(current)
     return pieces
+
+
+def _sentence_units(value: str) -> list[str]:
+    """Prefer Chinese sentence punctuation while retaining punctuation in output."""
+    units: list[str] = []
+    current = ""
+    terminal = set("。！？；：.!?;")
+    for character in value:
+        current += character
+        if character in terminal:
+            units.append(current.strip())
+            current = ""
+    if current.strip():
+        units.append(current.strip())
+    return units or [value]
+
+
+def _split_overlong(value: str, limit: int) -> list[str]:
+    """Use CJK punctuation then safe character boundaries, avoiding bad starts."""
+    result: list[str] = []
+    current = ""
+    preferred = set("。！？；：")
+    secondary = set("，、")
+    prohibited_start = set("，。！？；：、）》」』】％")
+    prohibited_end = set("（《「『【")
+    target = limit * 0.52
+    for character in value:
+        candidate = current + character
+        if current and text_width_units(candidate) > target:
+            split_at = max(
+                (index + 1 for index, item in enumerate(current) if item in preferred),
+                default=0,
+            )
+            if not split_at:
+                split_at = max(
+                    (index + 1 for index, item in enumerate(current) if item in secondary),
+                    default=0,
+                )
+            split_at = split_at or len(current)
+            while split_at > 1 and current[split_at - 1] in prohibited_end:
+                split_at -= 1
+            part, current = current[:split_at].strip(), current[split_at:]
+            while current and current[0] in prohibited_start:
+                part += current[0]
+                current = current[1:]
+            if part:
+                result.append(part)
+            current += character
+        else:
+            current = candidate
+    if current.strip():
+        result.append(current.strip())
+    return result
 
 
 def _layout_positions(context: SlideContext, resolved: list[ResolvedElement], archetype: LayoutArchetype, theme: ExecutivePolicyTheme, attributions: list[SourceAttribution]) -> list[PositionedElement]:
@@ -270,10 +327,12 @@ def _layout_positions(context: SlideContext, resolved: list[ResolvedElement], ar
         if focus is not None:
             if focus.title:
                 positions.append(_text_position(None, "caption", "caption", focus.title, Box(x=0.65, y=1.18, width=12.0, height=0.22), 12))
-                focus_box = Box(x=0.65, y=1.48, width=12.0, height=5.27)
+                focus_box = Box(x=0.65, y=1.48, width=12.0, height=4.55)
             else:
-                focus_box = Box(x=0.65, y=1.25, width=12.0, height=5.5)
+                focus_box = Box(x=0.65, y=1.25, width=12.0, height=4.8)
             positions.append(_payload_position(focus, focus.kind, focus_box, 12 if focus.kind == "table" else 10))
+            if remaining:
+                positions.extend(_payload_positions(remaining[:1], Box(x=0.85, y=6.18, width=11.65, height=0.62), theme))
         elif images:
             image = images[0]
             positions.append(_payload_position(image, "image", Box(x=6.55, y=1.25, width=6.2, height=5.1), None))
@@ -287,9 +346,32 @@ def _layout_positions(context: SlideContext, resolved: list[ResolvedElement], ar
         else:
             positions.extend(_payload_positions(remaining, Box(x=0.85, y=1.35, width=11.65, height=5.35), theme))
     if attributions:
-        footer = "  |  ".join(item.footer_text for item in attributions)
+        footer = _compact_footer(attributions, resolved)
         positions.append(_text_position(None, "footer", "footer", footer, Box(x=0.55, y=7.03, width=12.2, height=0.22), 10))
     return positions
+
+
+def _compact_footer(
+    attributions: list[SourceAttribution], resolved: Sequence[ResolvedElement]
+) -> str:
+    """Keep on-slide provenance readable; detailed IDs remain in audit JSON."""
+    labels = [item.filename or item.label or item.doc_id for item in attributions]
+    cjk = any(_contains_cjk(label) for label in labels) or any(
+        _contains_cjk(value)
+        for item in resolved
+        for value in ([item.text, item.title, item.caption] + (item.items or []))
+        if isinstance(value, str)
+    )
+    visible = labels[:2]
+    if cjk:
+        suffix = f"（另 {len(labels) - len(visible)} 份）" if len(labels) > len(visible) else ""
+        return f"來源：{'；'.join(visible)}{suffix}"
+    suffix = f" (+{len(labels) - len(visible)} more)" if len(labels) > len(visible) else ""
+    return f"Source: {'; '.join(visible)}{suffix}"
+
+
+def _contains_cjk(value: str) -> bool:
+    return any("\u3400" <= character <= "\u9fff" for character in value)
 
 
 def _payload_positions(payloads: list[ResolvedElement], area: Box, theme: ExecutivePolicyTheme) -> list[PositionedElement]:

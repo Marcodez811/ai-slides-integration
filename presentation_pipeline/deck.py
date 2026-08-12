@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import shutil
+import time
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Sequence
@@ -17,6 +18,7 @@ from presentation_pipeline.artifacts import write_outline_json, write_presentati
 from presentation_pipeline.generation import StructuredGenerator
 from presentation_pipeline.images import ImageGenerator
 from presentation_pipeline.pipeline import generate_plan
+from presentation_pipeline.observability import new_run_id, safe_event, stage_timer
 from presentation_pipeline.planning.models import PresentationRequirements, SlidePurpose
 from presentation_pipeline.results import PresentationPlanningResult
 from presentation_pipeline.synthesis import (
@@ -35,12 +37,17 @@ class DeckGenerationConfig:
     generate_images: bool = False
     max_generated_images: int = 3
     image_concurrency: int = 1
+    keep_failed_artifacts: bool = False
+    run_id: str | None = None
+    log_path: str | None = None
 
     def __post_init__(self) -> None:
         if self.max_generated_images < 0:
             raise ValueError("max_generated_images must not be negative")
         if self.image_concurrency < 1:
             raise ValueError("image_concurrency must be at least 1")
+        if self.run_id is not None and not self.run_id.strip():
+            raise ValueError("run_id must not be blank")
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,56 +92,97 @@ async def generate_deck(
     )
 
     settings = config or DeckGenerationConfig()
+    run_id = settings.run_id or new_run_id()
+    started = time.perf_counter()
     root = Path(output_dir).absolute()
     staging_root = _create_staging_root(root, overwrite=overwrite)
     artifacts = _artifact_paths(staging_root)
     published_artifacts = _artifact_paths(root)
+    failed_stage = "planning"
     try:
-        plan = await generate_plan(
-            input_paths,
-            requirements,
-            generator,
-            extraction_workers=extraction_workers,
-            llm_concurrency=llm_concurrency,
-            asset_output_dir=staging_root / "assets" / "source",
-        )
-        contexts = build_slide_contexts(plan)
-        slides = await generate_slide_contents(contexts, generator, concurrency=llm_concurrency)
+        with stage_timer("planning", document_count=len(input_paths)):
+            plan = await generate_plan(
+                input_paths,
+                requirements,
+                generator,
+                extraction_workers=extraction_workers,
+                llm_concurrency=llm_concurrency,
+                asset_output_dir=staging_root / "assets" / "source",
+            )
+        failed_stage = "slide_context_resolution"
+        with stage_timer(failed_stage, semantic_slide_count=len(plan.outline.all_slides())):
+            contexts = build_slide_contexts(plan)
+        failed_stage = "slide_content_generation"
+        with stage_timer(failed_stage, slide_count=len(contexts)):
+            slides = await generate_slide_contents(contexts, generator, concurrency=llm_concurrency)
         content = build_presentation_content(slides, contexts)
         diagnostics: list[dict[str, object]] = []
-        resolved_by_slide = _resolve_render_elements(plan, contexts, content, staging_root, diagnostics)
+        failed_stage = "render_input_resolution"
+        with stage_timer(failed_stage, slide_count=len(content.slides)):
+            resolved_by_slide = _resolve_render_elements(plan, contexts, content, staging_root, diagnostics)
         image_outcomes: list[dict[str, object]] = []
         if settings.generate_images and image_generator is not None:
-            image_outcomes = await _add_generated_images(
-                contexts,
-                content,
-                resolved_by_slide,
-                image_generator,
-                staging_root / "assets" / "generated",
-                settings,
-                diagnostics,
-                audience=plan.requirements.audience,
-                tone=plan.requirements.tone,
-            )
+            failed_stage = "decorative_image_generation"
+            with stage_timer(failed_stage):
+                image_outcomes = await _add_generated_images(
+                    contexts, content, resolved_by_slide, image_generator,
+                    staging_root / "assets" / "generated", settings, diagnostics,
+                    audience=plan.requirements.audience, tone=plan.requirements.tone,
+                )
 
-        layout = build_presentation_layout(contexts, content.slides, resolved_by_slide)
-        validation = [diagnostic for physical_slide in layout.slides for diagnostic in validate_layout(physical_slide)]
+        failed_stage = "layout_generation"
+        with stage_timer(failed_stage):
+            layout = build_presentation_layout(contexts, content.slides, resolved_by_slide)
+        archetypes: dict[str, int] = {}
+        for physical_slide in layout.slides:
+            key = physical_slide.archetype.value
+            archetypes[key] = archetypes.get(key, 0) + 1
+        safe_event(
+            "layout_complete",
+            semantic_slide_count=len(content.slides),
+            physical_slide_count=len(layout.slides),
+            continuation_slide_count=sum(slide.is_continuation for slide in layout.slides),
+            layout_archetype_counts=archetypes,
+        )
+        failed_stage = "layout_validation"
+        with stage_timer(failed_stage, physical_slide_count=len(layout.slides)):
+            validation = [diagnostic for physical_slide in layout.slides for diagnostic in validate_layout(physical_slide)]
         diagnostics.extend(_as_json(item) for item in validation)
         blocking = [item for item in validation if _diagnostic_severity(item) == "error"]
         if blocking:
             raise ValueError(f"layout validation failed with {len(blocking)} error(s)")
 
-        render_report = render_presentation(layout, artifacts["pptx"])
+        failed_stage = "pptx_render"
+        with stage_timer(failed_stage):
+            render_report = render_presentation(layout, artifacts["pptx"])
+        safe_event(
+            "pptx_render_complete",
+            semantic_slide_count=len(content.slides),
+            physical_slide_count=len(layout.slides),
+            continuation_slide_count=sum(slide.is_continuation for slide in layout.slides),
+            render_warning_count=sum(_diagnostic_severity(item) == "warning" for item in render_report.diagnostics),
+            render_error_count=sum(_diagnostic_severity(item) == "error" for item in render_report.diagnostics),
+            source_image_count=len(render_report.source_assets),
+            generated_image_count=len(render_report.generated_assets),
+        )
         # Do not trust the renderer's library-level reopen alone.  The package
         # validator is the promotion gate and has no python-pptx dependency.
         from presentation_pipeline.rendering.verification import verify_pptx
 
-        verification = verify_pptx(
-            artifacts["pptx"],
-            expected_slide_count=len(getattr(layout, "slides", ())),
-            reported_path=published_artifacts["pptx"],
-        )
+        failed_stage = "pptx_verification"
+        with stage_timer(failed_stage):
+            verification = verify_pptx(
+                artifacts["pptx"], expected_slide_count=len(getattr(layout, "slides", ())),
+                reported_path=published_artifacts["pptx"],
+            )
         diagnostics.extend(_as_json(item) for item in verification.diagnostics)
+        safe_event(
+            "pptx_verification_complete",
+            verification_mode=verification.verifier_mode,
+            verified=verification.verified,
+            expected_slide_count=len(layout.slides),
+            actual_slide_count=verification.slide_count,
+        )
         if not verification.verified:
             raise DeckPromotionError("PPTX package verification failed; staged output was not promoted")
         render_report = render_report.model_copy(update={
@@ -142,9 +190,11 @@ async def generate_deck(
             "independent_verified": verification.verified,
         })
 
-        write_outline_json(plan.outline, artifacts["outline"], overwrite=False)
-        write_presentation_content_json(content, artifacts["content"], overwrite=False)
-        _write_json(artifacts["layout"], layout, overwrite=False, staging_root=staging_root, published_root=root)
+        failed_stage = "artifact_write"
+        with stage_timer(failed_stage):
+            write_outline_json(plan.outline, artifacts["outline"], overwrite=False)
+            write_presentation_content_json(content, artifacts["content"], overwrite=False)
+            _write_json(artifacts["layout"], layout, overwrite=False, staging_root=staging_root, published_root=root)
         full_report = {
             "pptx_path": str(published_artifacts["pptx"]),
             "semantic_slide_count": len(content.slides),
@@ -160,9 +210,26 @@ async def generate_deck(
             "diagnostics": diagnostics,
         }
         _write_json(artifacts["report"], full_report, overwrite=False, staging_root=staging_root, published_root=root)
-        _promote_staging_root(staging_root, root, overwrite=overwrite)
-    except BaseException:
-        _remove_staging_root(staging_root)
+        failed_stage = "promotion"
+        with stage_timer(failed_stage):
+            _promote_staging_root(staging_root, root, overwrite=overwrite)
+    except BaseException as error:
+        failed_stage = _failure_stage(failed_stage, error)
+        failed_root = _preserve_failure(
+            staging_root, root, run_id=run_id, keep=settings.keep_failed_artifacts
+        )
+        report = _failure_report(
+            root=root,
+            run_id=run_id,
+            failed_stage=failed_stage,
+            error=error,
+            elapsed_seconds=time.perf_counter() - started,
+            input_paths=input_paths,
+            log_path=settings.log_path,
+            failed_artifacts_path=failed_root,
+        )
+        _write_json(report[0], report[1], overwrite=True)
+        safe_event("deck_failed", run_id=run_id, failed_stage=failed_stage, error_type=type(error).__name__)
         raise
     return DeckGenerationResult(
         planning=plan,
@@ -193,6 +260,10 @@ def _resolve_render_elements(
     }
     assets_by_doc: dict[str, dict[str, object]] = {}
     artifacts_by_doc = {artifact.doc_id: artifact for artifact in plan.artifacts}
+    nodes_by_doc = {
+        artifact.doc_id: {node.node_id: node for node in artifact.extraction.nodes}
+        for artifact in plan.artifacts
+    }
     source_filenames = {artifact.doc_id: artifact.filename for artifact in plan.artifacts}
     for artifact in plan.artifacts:
         source_dir = root / "assets" / "source" / artifact.job_id
@@ -211,8 +282,7 @@ def _resolve_render_elements(
                 table = None
                 if evidence is not None and artifact is not None:
                     node_ids = getattr(evidence, "source_node_ids", [])
-                    nodes = {node.node_id: node for node in artifact.extraction.nodes}
-                    table = nodes.get(node_ids[0]) if node_ids else None
+                    table = nodes_by_doc.get(element.doc_id, {}).get(node_ids[0]) if node_ids else None
                 if table is not None and getattr(table.kind, "value", table.kind) == "table":
                     profile = profile_table(table, artifact.extraction.nodes)
                     if profile.rectangular:
@@ -398,6 +468,56 @@ def _promote_staging_root(staging_root: Path, root: Path, *, overwrite: bool) ->
 def _remove_staging_root(path: Path) -> None:
     if path.exists() and path.is_dir() and path.name.startswith("."):
         shutil.rmtree(path, ignore_errors=True)
+
+
+def _preserve_failure(staging_root: Path, root: Path, *, run_id: str, keep: bool) -> Path | None:
+    if not keep:
+        _remove_staging_root(staging_root)
+        return None
+    failure_root = root.parent / ".presentation-failures" / f"{root.name}-{run_id}"
+    failure_root.parent.mkdir(parents=True, exist_ok=True)
+    if staging_root.exists():
+        staging_root.replace(failure_root)
+    return failure_root
+
+
+def _failure_report(
+    *,
+    root: Path,
+    run_id: str,
+    failed_stage: str,
+    error: BaseException,
+    elapsed_seconds: float,
+    input_paths: Sequence[str | Path],
+    log_path: str | None,
+    failed_artifacts_path: Path | None,
+) -> tuple[Path, dict[str, object]]:
+    directory = root.parent / ".presentation-failures"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{root.name}-{run_id}.json"
+    return path, {
+        "run_id": run_id,
+        "success": False,
+        "failed_stage": failed_stage,
+        "error_type": type(error).__name__,
+        "message": str(error)[:512],
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "documents": [Path(item).name for item in input_paths],
+        "log_path": log_path,
+        "failed_artifacts_path": str(failed_artifacts_path) if failed_artifacts_path else None,
+    }
+
+
+def _failure_stage(default: str, error: BaseException) -> str:
+    """Expose provider/budget stages without coupling domain errors to deck code."""
+    stage = getattr(error, "stage", None)
+    if isinstance(stage, str) and stage.strip():
+        return stage
+    from presentation_pipeline.understanding.reduction import ReductionNonReductionError
+
+    if isinstance(error, ReductionNonReductionError):
+        return "document_digest_reduction"
+    return default
 
 
 def _replace_staging_paths(value: object, staging_root: Path, published_root: Path) -> object:

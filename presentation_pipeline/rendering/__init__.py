@@ -6,6 +6,7 @@ from .layout import (
     build_slide_layout,
     select_layout,
     text_capacity,
+    text_width_units,
     validate_layout,
 )
 from .inputs import resolve_render_inputs
@@ -32,5 +33,5 @@ __all__ = [
     "PhysicalSlideLayout", "PositionedElement", "PresentationLayout", "PresentationRenderError",
     "RenderDiagnostic", "RenderInputResult", "RenderReport", "ResolvedElement", "SourceAttribution",
     "TableCell", "TablePayload", "build_presentation_layout", "build_slide_layout",
-    "render_presentation", "resolve_render_inputs", "select_layout", "text_capacity", "validate_layout",
+    "render_presentation", "resolve_render_inputs", "select_layout", "text_capacity", "text_width_units", "validate_layout",
 ]

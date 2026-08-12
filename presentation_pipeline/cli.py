@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .deck import DeckGenerationConfig, generate_deck
 from .images import OpenAIImageGenerator
+from .observability import configure_run_logging, telemetry_logger
 from .planning import PresentationRequirements
 from .providers import OpenAIStructuredGenerator
 
@@ -32,10 +33,15 @@ def _parser() -> argparse.ArgumentParser:
     generate.add_argument("--overwrite", action="store_true")
     generate.add_argument("--extraction-workers", type=int, default=4)
     generate.add_argument("--llm-concurrency", type=int, default=4)
+    generate.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
+    generate.add_argument("--debug", action="store_true")
+    generate.add_argument("--keep-failed-artifacts", action="store_true")
     return parser
 
 
 async def _run(args: argparse.Namespace) -> Path:
+    log_level = "DEBUG" if args.debug else args.log_level
+    run_id, log_path = configure_run_logging(output_dir=args.output_dir, log_level=log_level)
     requirements = PresentationRequirements(
         goal=args.goal,
         audience=args.audience,
@@ -45,7 +51,10 @@ async def _run(args: argparse.Namespace) -> Path:
         must_include=args.must_include,
         must_avoid=args.must_avoid,
     )
-    generator = OpenAIStructuredGenerator(model=os.environ.get("OPENAI_MODEL", "gpt-5.6-terra"))
+    generator = OpenAIStructuredGenerator(
+        model=os.environ.get("OPENAI_MODEL", "gpt-5.6-terra"),
+        telemetry_handler=telemetry_logger,
+    )
     image_generator = (
         OpenAIImageGenerator(model=os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-2"))
         if args.generate_images
@@ -61,6 +70,9 @@ async def _run(args: argparse.Namespace) -> Path:
             generate_images=args.generate_images,
             max_generated_images=args.max_generated_images,
             image_concurrency=args.image_concurrency,
+            keep_failed_artifacts=args.keep_failed_artifacts or args.debug,
+            run_id=run_id,
+            log_path=str(log_path),
         ),
         extraction_workers=args.extraction_workers,
         llm_concurrency=args.llm_concurrency,

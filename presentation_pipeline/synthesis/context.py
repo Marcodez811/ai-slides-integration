@@ -112,6 +112,7 @@ def build_slide_contexts(plan: PresentationPlanningResult) -> list[SlideContext]
     """
     index_by_doc = _index_indexes(plan.indexes)
     selected_reasons = _index_selection(plan)
+    candidate_by_identity = _index_candidates(plan)
     _validate_selected_evidence(selected_reasons, index_by_doc)
     total_slides = len(plan.outline.all_slides())
     contexts: list[SlideContext] = []
@@ -124,6 +125,7 @@ def build_slide_contexts(plan: PresentationPlanningResult) -> list[SlideContext]
                 slide,
                 index_by_doc=index_by_doc,
                 selected_reasons=selected_reasons,
+                candidate_by_identity=candidate_by_identity,
             )
             if not evidence and slide.purpose not in {SlidePurpose.TITLE, SlidePurpose.SECTION}:
                 raise SlideContextResolutionError(
@@ -183,6 +185,19 @@ def _index_selection(plan: PresentationPlanningResult) -> dict[tuple[str, str], 
     return selected
 
 
+def _index_candidates(plan: PresentationPlanningResult) -> dict[tuple[str, str], object] | None:
+    """Retain bounded retrieval transport slices without changing public models."""
+    if plan.candidates is None:
+        return None
+    result: dict[tuple[str, str], object] = {}
+    for candidate in plan.candidates.candidates:
+        identity = (candidate.doc_id, candidate.evidence_id)
+        if identity in result:
+            raise SlideContextResolutionError(f"duplicate candidate evidence {identity!r}")
+        result[identity] = candidate
+    return result
+
+
 def _validate_selected_evidence(
     selected_reasons: dict[tuple[str, str], str],
     index_by_doc: dict[str, dict[str, EvidenceItem]],
@@ -199,6 +214,7 @@ def _resolve_slide_evidence(
     *,
     index_by_doc: dict[str, dict[str, EvidenceItem]],
     selected_reasons: dict[tuple[str, str], str],
+    candidate_by_identity: dict[tuple[str, str], object] | None,
 ) -> list[ResolvedEvidence]:
     resolved: list[ResolvedEvidence] = []
     seen: set[tuple[str, str]] = set()
@@ -225,16 +241,24 @@ def _resolve_slide_evidence(
                 raise SlideContextResolutionError(
                     f"slide {slide.slide_id!r} references unselected evidence {identity!r}"
                 )
-            resolved.append(_resolved_evidence(item, reason))
+            candidate = candidate_by_identity.get(identity) if candidate_by_identity is not None else None
+            transport = candidate.transport_content() if candidate is not None else None
+            resolved.append(_resolved_evidence(item, reason, transport))
     return resolved
 
 
-def _resolved_evidence(item: EvidenceItem, selection_reason: str) -> ResolvedEvidence:
+def _resolved_evidence(
+    item: EvidenceItem, selection_reason: str, transport_content: dict[str, object] | None = None
+) -> ResolvedEvidence:
     try:
-        compact = compact_evidence_item(item)
+        compact = transport_content if transport_content is not None else compact_evidence_item(item)
+        if not isinstance(compact, dict):
+            raise ValueError("candidate transport content must be a dictionary")
         return ResolvedEvidence(
             doc_id=item.doc_id,
             evidence_id=item.evidence_id,
+            # Canonical identity and kind remain authoritative. Only semantic
+            # content can come from a bounded retrieval transport slice.
             kind=item.kind,
             text=compact.get("text"),
             structured_data=compact.get("content", {}),

@@ -18,6 +18,7 @@ from presentation_pipeline.rendering import (
     render_presentation,
     resolve_render_inputs,
     select_layout,
+    text_width_units,
     validate_layout,
 )
 from presentation_pipeline.synthesis.context import SlideContext
@@ -63,6 +64,24 @@ def test_models_are_strict_and_geometry_is_validated() -> None:
         Box(x=-0.1, y=0.0, width=1.0, height=1.0)
     with pytest.raises(ValueError, match="incomplete"):
         ResolvedElement(element_index=0, kind="chart")
+
+
+def test_default_theme_is_traditional_chinese_first() -> None:
+    from presentation_pipeline.rendering import ExecutivePolicyTheme
+
+    theme = ExecutivePolicyTheme()
+    assert theme.title_font == theme.body_font == theme.east_asian_font == "Microsoft JhengHei"
+    assert theme.fallback_font == "Noto Sans TC"
+
+
+def test_cjk_width_and_splitter_are_conservative_and_punctuation_aware() -> None:
+    from presentation_pipeline.rendering.layout import _split_text
+
+    assert text_width_units("漢字漢字") > text_width_units("abcd")
+    chunks = _split_text("第一段說明，這裡有更多內容。第二段繼續說明，並且仍然需要分頁。", 12)
+    assert len(chunks) > 1
+    assert any(chunk.endswith("。") for chunk in chunks[:-1])
+    assert not any(chunk.startswith(("，", "。", "！", "？", "；", "：", "、")) for chunk in chunks)
 
 
 def test_layout_selection_prefers_decorative_image_and_places_columns() -> None:
@@ -222,4 +241,23 @@ def test_renderer_writes_source_footer_real_bullets_and_east_asian_font(tmp_path
     xml = "".join(shape.element.xml for shape in slide.shapes)
     assert "a:buChar" in xml
     assert "Microsoft JhengHei" in xml
-    assert "Source: policy.docx (ev-1)" in " ".join(shape.text for shape in slide.shapes if hasattr(shape, "text"))
+    slide_text = " ".join(shape.text for shape in slide.shapes if hasattr(shape, "text"))
+    assert "來源：policy.docx" in slide_text
+    assert "ev-1" not in slide_text
+    assert 'b="1"' in xml
+
+
+def test_source_footer_is_compact_and_localized_for_chinese_multi_source() -> None:
+    content = _text_content("sources-zh")
+    layout = build_slide_layout(
+        _context("sources-zh"), content,
+        [{"element_index": 0, "kind": "text", "text": "繁體中文重點", "attribution": [
+            {"doc_id": "doc-1", "evidence_ids": ["ev-1"]},
+            {"doc_id": "doc-2", "evidence_ids": ["ev-2"]},
+            {"doc_id": "doc-3", "evidence_ids": ["ev-3"]},
+        ]}],
+    )
+    footer = next(item.text for item in layout.elements if item.role == "footer")
+    # Without filenames these logical source IDs still use Chinese UI because
+    # the slide content is Traditional Chinese.
+    assert footer == "來源：doc-1；doc-2（另 1 份）"

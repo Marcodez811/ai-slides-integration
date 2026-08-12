@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeVar
 
@@ -217,14 +218,50 @@ class GenerationLimiter:
     ) -> TStructured:
         from presentation_pipeline.generation import invoke_structured
 
-        enforce_input_budget(
+        estimated_tokens = enforce_input_budget(
             input_data=input_data,
             system_prompt=system_prompt,
             token_counter=self._token_counter,
             budget=budget,
             stage=stage,
         )
-        async with self._semaphore:
-            return await invoke_structured(
-                self._generator, system_prompt, input_data, response_model
+        from presentation_pipeline.observability import safe_error, safe_event
+
+        safe_event(
+            "generation_budgeted",
+            stage=stage,
+            response_model=response_model.__name__,
+            estimated_input_tokens=estimated_tokens,
+            input_limit_tokens=budget.usable_input_tokens,
+        )
+        started = time.perf_counter()
+        try:
+            async with self._semaphore:
+                result = await invoke_structured(
+                    self._generator, system_prompt, input_data, response_model
+                )
+        except BaseException as error:
+            # Carry only the pipeline stage forward for failure reports. This
+            # avoids wrapping provider/domain exceptions or exposing payloads.
+            if not hasattr(error, "stage"):
+                try:
+                    setattr(error, "stage", stage)
+                except (AttributeError, TypeError):
+                    pass
+            safe_error(
+                "generation_complete",
+                stage=stage,
+                response_model=response_model.__name__,
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
+                outcome="error",
+                error_type=type(error).__name__,
             )
+            raise
+        safe_event(
+            "generation_complete",
+            stage=stage,
+            response_model=response_model.__name__,
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
+            outcome="success",
+        )
+        return result

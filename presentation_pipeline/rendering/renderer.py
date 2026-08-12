@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
+import shutil
+import subprocess
 
 from .layout import LayoutValidationError, validate_layout
 from .models import PhysicalSlideLayout, PresentationLayout, RenderDiagnostic, RenderReport
@@ -17,6 +19,16 @@ def render_presentation(layout: PresentationLayout | Sequence[PhysicalSlideLayou
     """Render an editable 16:9 deck and verify that the package reopens."""
     presentation_layout = layout if isinstance(layout, PresentationLayout) else PresentationLayout(slides=list(layout))
     diagnostics = [diagnostic for slide in presentation_layout.slides for diagnostic in validate_layout(slide)]
+    theme = presentation_layout.slides[0].theme
+    if not _font_is_locally_available(theme.title_font):
+        diagnostics.append(RenderDiagnostic(
+            severity="warning",
+            code="FONT_NOT_INSTALLED_LOCALLY",
+            message=(
+                f"Requested font {theme.title_font!r} is not installed locally; "
+                f"PowerPoint may use {theme.fallback_font!r}."
+            ),
+        ))
     errors = [diagnostic for diagnostic in diagnostics if diagnostic.severity == "error"]
     if errors:
         raise LayoutValidationError("; ".join(diagnostic.message for diagnostic in errors))
@@ -104,6 +116,7 @@ def _add_textbox(slide, text, element, theme, x, y, width, height, Pt, RGBColor,
             _set_real_bullet(paragraph, OxmlElement)
         font = paragraph.font
         font.name = theme.title_font if element.role in {"title", "section_title"} else theme.body_font
+        font.bold = element.role in {"title", "section_title"}
         font.size = Pt(element.font_size_pt or theme.minimum_body_font_pt)
         font.color.rgb = RGBColor.from_string(theme.primary_color if element.role in {"title", "section_title"} else (theme.muted_color if element.role in {"caption", "footer"} else theme.text_color))
         _set_east_asian_font(paragraph, theme.east_asian_font, OxmlElement)
@@ -206,3 +219,22 @@ def _set_east_asian_font(paragraph, typeface: str, OxmlElement) -> None:
             east_asian = OxmlElement("a:ea")
             r_pr.append(east_asian)
         east_asian.set("typeface", typeface)
+
+
+def _font_is_locally_available(font_name: str) -> bool:
+    """Best-effort diagnostic only; unavailable fonts never block PPTX output."""
+    executable = shutil.which("fc-match")
+    if executable is None:
+        return True
+    try:
+        result = subprocess.run(
+            [executable, "--format=%{family}", font_name],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    families = {part.strip().casefold() for part in result.stdout.split(",") if part.strip()}
+    return font_name.casefold() in families

@@ -298,9 +298,10 @@ class ExecutivePolicyTheme(RenderingModel):
     name: str = "Executive Policy"
     slide_width_inches: float = Field(default=13.333, gt=0)
     slide_height_inches: float = Field(default=7.5, gt=0)
-    title_font: str = "Aptos Display"
-    body_font: str = "Aptos"
+    title_font: str = "Microsoft JhengHei"
+    body_font: str = "Microsoft JhengHei"
     east_asian_font: str = "Microsoft JhengHei"
+    fallback_font: str = "Noto Sans TC"
     background_color: str = "F7F8FA"
     primary_color: str = "153B5B"
     accent_color: str = "2D7D9A"
@@ -309,7 +310,7 @@ class ExecutivePolicyTheme(RenderingModel):
     minimum_body_font_pt: float = Field(default=18, ge=10, le=30)
     maximum_body_font_pt: float = Field(default=22, ge=10, le=40)
 
-    @field_validator("name", "title_font", "body_font", "east_asian_font")
+    @field_validator("name", "title_font", "body_font", "east_asian_font", "fallback_font")
     @classmethod
     def _theme_text_is_not_blank(cls, value: str) -> str:
         if not value.strip():
