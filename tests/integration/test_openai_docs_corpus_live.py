@@ -25,6 +25,26 @@ _RUN_OPENAI = os.environ.get("RUN_OPENAI_INTEGRATION_TESTS") == "1" and bool(
     os.environ.get("OPENAI_API_KEY")
 )
 
+# This is intentionally a fixed, small offline corpus rather than a glob.  It
+# guards the high-value mixed-content path without making normal generation or
+# an OpenAI credential part of the regression contract.
+_FIVE_DOCX_MANIFEST = {
+    "documents": (
+        "(醫管組)1150712_台灣醫事法律學會-AI智慧健保治理-談參資料(草案)_1150623奉核.docx",
+        "1140910_偏鄉方案及保障(行政科).docx",
+        "20260321_ 雲林國際居家醫療研討會-談參資料(規劃科).docx",
+        "中央癌症防治會報第21次會議-備參資料(規劃科).docx",
+        "南投縣衛生局智慧醫療雲備參(醫管組).docx",
+    ),
+    "evidence_counts": {
+        "text": 2461,
+        "list": 336,
+        "table": 37,
+        "image": 4,
+        "chart_candidate": 2,
+    },
+}
+
 
 def _document_paths() -> list[Path]:
     paths = sorted(_DOCS_DIR.glob("*.docx"))
@@ -46,6 +66,102 @@ def _output_dir() -> Path:
     path = configured if configured.is_absolute() else _ROOT / configured
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _five_docx_paths() -> list[Path]:
+    return [_DOCS_DIR / name for name in _FIVE_DOCX_MANIFEST["documents"]]
+
+
+@pytest.mark.skipif(
+    not all(path.is_file() for path in _five_docx_paths()),
+    reason="the fixed five-DOCX offline regression corpus is unavailable",
+)
+def test_fixed_five_docx_manifest_preserves_expected_evidence_counts(tmp_path) -> None:
+    """Run a no-network extraction/indexing manifest regression where available."""
+    from loguru import logger
+
+    from presentation_pipeline.corpus.batch import build_jobs, extract_batch
+    from presentation_pipeline.indexing.builder import build_document_index
+    from presentation_pipeline.rendering import resolve_render_inputs
+    from presentation_pipeline.validation import CorpusLookup
+    from docx_pipeline.enrichment.table_profiler import profile_table
+
+    paths = _five_docx_paths()
+    logger.disable("docx_pipeline")
+    try:
+        batch = extract_batch(build_jobs(paths), max_workers=min(4, len(paths)))
+    finally:
+        logger.enable("docx_pipeline")
+    assert not batch.failures
+    assert all(document.extraction.coverage.silent_losses == 0 for document in batch.documents)
+    indexes = [build_document_index(artifact) for artifact in batch.documents]
+    CorpusLookup.from_artifacts_indexes(batch.documents, indexes)
+    counts = Counter(
+        evidence.kind.value
+        for index in indexes
+        for evidence in index.evidence
+    )
+    assert {kind: counts[kind] for kind in _FIVE_DOCX_MANIFEST["evidence_counts"]} == _FIVE_DOCX_MANIFEST["evidence_counts"]
+
+    artifacts_by_doc = {artifact.doc_id: artifact for artifact in batch.documents}
+    source_lookup = {(index.doc_id, evidence.evidence_id): evidence for index in indexes for evidence in index.evidence}
+    resolver_failures: list[dict[str, str]] = []
+    checked = Counter()
+    for index in indexes:
+        artifact = artifacts_by_doc[index.doc_id]
+        nodes = {node.node_id: node for node in artifact.extraction.nodes}
+        for evidence in index.evidence:
+            kind = evidence.kind.value
+            if kind not in {"table", "image", "chart_candidate"}:
+                continue
+            checked[kind] += 1
+            value: dict[str, object] = {
+                "kind": "chart" if kind == "chart_candidate" else kind,
+                "doc_id": index.doc_id,
+                "evidence_id": evidence.evidence_id,
+                "title": f"Source {kind}",
+            }
+            if kind == "chart_candidate":
+                value["chart_type"] = "bar"
+            elif kind == "image":
+                value["caption"] = "Source image"
+            elif kind == "table":
+                node = nodes[evidence.source_node_ids[0]]
+                profile = profile_table(node, artifact.extraction.nodes)
+                row_count = max((cell.row + cell.row_span for cell in profile.cells), default=0)
+                rows: list[list[object]] = [["" for _ in range(profile.column_count)] for _ in range(row_count)]
+                for cell in profile.cells:
+                    rows[cell.row][cell.column] = {
+                        "text": cell.original,
+                        "row_span": cell.row_span,
+                        "column_span": cell.column_span,
+                    }
+                value["rows"] = rows
+                value["header_rows"] = list(profile.header_rows)
+            result = resolve_render_inputs(
+                f"audit-{kind}-{checked[kind]}",
+                [value],
+                source_lookup=source_lookup,
+                source_filenames={index.doc_id: artifact.filename},
+            )
+            if len(result.elements) != 1 or any(item.code == "RENDER_INPUT_INVALID" for item in result.diagnostics):
+                resolver_failures.append({"kind": kind, "evidence_id": evidence.evidence_id})
+            if kind == "chart_candidate" and result.elements[0].kind != "chart":
+                resolver_failures.append({"kind": kind, "evidence_id": evidence.evidence_id})
+    assert checked == Counter({"table": 37, "image": 4, "chart_candidate": 2})
+    assert not resolver_failures
+
+    report = {
+        "documents": [path.name for path in paths],
+        "evidence_counts": dict(counts),
+        "resolver_contract_counts": dict(checked),
+        "resolver_failures": resolver_failures,
+        "silent_losses": sum(document.extraction.coverage.silent_losses for document in batch.documents),
+    }
+    (tmp_path / "five-docx-deterministic-report.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _write_report(filename: str, report: dict[str, object]) -> Path:

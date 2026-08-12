@@ -10,6 +10,7 @@ dependencies = [
     "loguru>=0.7.3",
     "pydantic>=2.13.4",
     "openai>=2.53.0",
+    "python-pptx>=1.0.2",
 ]
 
 [build-system]
@@ -27,6 +28,7 @@ dev = [
 
 [project.scripts]
 docx-pipeline = "docx_pipeline.cli:main"
+presentation-pipeline = "presentation_pipeline.cli:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

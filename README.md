@@ -138,6 +138,66 @@ deterministic report. Optional overrides include `OPENAI_MODEL`,
 `OPENAI_DOCS_OUTPUT_DIR`. Normal `uv run pytest` runs still skip both corpus
 tests and never read `.env` automatically.
 
+### Generate a reviewable PowerPoint deck
+
+The pipeline can now complete the full path from DOCX documents to an editable,
+16:9 PowerPoint deck. The first renderer uses a fixed executive-policy visual
+system and a finite layout vocabulary: title, section divider, headline/body,
+key points, two-column, visual/text, table, and chart-focused slides. It writes
+the PPTX alongside its validated outline, semantic content, physical layout,
+source/generated assets, and a machine-readable rendering report.
+
+```bash
+OPENAI_API_KEY=... uv run presentation-pipeline generate docs/*.docx \
+  --goal "Synthesize the health-policy material into an actionable briefing" \
+  --audience "Senior health-policy leadership" \
+  --slides 10 \
+  --tone "concise, evidence-led, executive" \
+  --output-dir output/pptx-evaluation \
+  --generate-images \
+  --image-concurrency 2
+```
+
+`--generate-images` is optional. When enabled, it can add at most three
+OpenAI-generated decorative illustrations; they never replace source evidence,
+tables, charts, numbers, logos, or source-document images. A failed image
+request falls back to a text-first layout and is recorded in
+`render-report.json`. Table-derived chart candidates become editable charts.
+Native DOCX charts without extracted values become visible source summaries with
+a warning rather than invented data. Candidate selection is deterministic before
+any image request, and `--image-concurrency` only controls the bounded number
+of simultaneous image API calls.
+
+Deck outputs are written in a sibling staging directory and promoted only after
+the PPTX passes an independent OOXML ZIP/XML/relationship/slide-count check
+(with an additional LibreOffice conversion check when `soffice` is available).
+An existing output directory is rejected unless `--overwrite` is set; an
+overwrite keeps the prior directory intact until the new staged deck passes its
+promotion gate. Audit JSON contains only published paths, never staging paths.
+
+For the curated five-document healthcare workflow used by the offline
+regression, run:
+
+```bash
+uv run --env-file .env presentation-pipeline generate \
+  'docs/(醫管組)1150712_台灣醫事法律學會-AI智慧健保治理-談參資料(草案)_1150623奉核.docx' \
+  'docs/1140910_偏鄉方案及保障(行政科).docx' \
+  'docs/20260321_ 雲林國際居家醫療研討會-談參資料(規劃科).docx' \
+  'docs/中央癌症防治會報第21次會議-備參資料(規劃科).docx' \
+  'docs/南投縣衛生局智慧醫療雲備參(醫管組).docx' \
+  --goal 'Synthesize digital-health governance, healthcare access, home care, cancer policy, and smart-care infrastructure into one actionable executive briefing.' \
+  --audience 'Senior health-policy leadership' \
+  --slides 10 \
+  --tone 'concise, evidence-led, executive' \
+  --presentation-type 'executive policy briefing' \
+  --must-include 'cross-document priorities and actionable recommendations' \
+  --output-dir 'output/five-docx-healthcare-briefing'
+```
+
+Append `--generate-images --max-generated-images 3 --image-concurrency 3`
+to opt into decorative image generation. Add `--overwrite` only when the
+entire existing output directory should be replaced.
+
 ## Python API
 
 ```python

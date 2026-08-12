@@ -39,6 +39,7 @@ async def generate_plan(
     extraction_workers: int = 4,
     llm_concurrency: int = 4,
     scale_config: PlanningScaleConfig | None = None,
+    asset_output_dir: str | Path | None = None,
 ) -> PresentationPlanningResult:
     """Return all validated, reusable intermediates from one planning pass.
 
@@ -48,7 +49,13 @@ async def generate_plan(
     """
     if not input_paths:
         raise ValueError("at least one input document is required")
-    jobs = build_jobs(input_paths)
+    # Preserve the exact legacy call shape when no renderer needs materialized
+    # media; existing injected batch adapters then remain source-compatible.
+    jobs = (
+        build_jobs(input_paths, asset_output_dir=asset_output_dir)
+        if asset_output_dir is not None
+        else build_jobs(input_paths)
+    )
     batch: BatchExtractionResult = extract_batch(jobs, max_workers=extraction_workers)
     if batch.failures:
         raise BatchExtractionError(batch.failures)
@@ -122,6 +129,7 @@ async def generate_outline(
     extraction_workers: int = 4,
     llm_concurrency: int = 4,
     scale_config: PlanningScaleConfig | None = None,
+    asset_output_dir: str | Path | None = None,
 ) -> PresentationOutline:
     """Return the outline from a single complete presentation planning pass."""
     result = await generate_plan(
@@ -131,5 +139,6 @@ async def generate_outline(
         extraction_workers=extraction_workers,
         llm_concurrency=llm_concurrency,
         scale_config=scale_config,
+        asset_output_dir=asset_output_dir,
     )
     return result.outline
