@@ -225,16 +225,28 @@ class GenerationLimiter:
             budget=budget,
             stage=stage,
         )
-        from presentation_pipeline.observability import safe_error, safe_event
+        from presentation_pipeline.observability import (
+            bind_limiter_call,
+            record_limiter_call,
+            reset_limiter_call,
+            safe_error,
+            safe_event,
+        )
 
+        record_limiter_call(stage=stage)
         safe_event(
-            "generation_budgeted",
+            "llm_call_start",
             stage=stage,
             response_model=response_model.__name__,
             estimated_input_tokens=estimated_tokens,
             input_limit_tokens=budget.usable_input_tokens,
         )
         started = time.perf_counter()
+        correlation = bind_limiter_call(
+            stage=stage,
+            response_model=response_model.__name__,
+            estimated_input_tokens=estimated_tokens,
+        )
         try:
             async with self._semaphore:
                 result = await invoke_structured(
@@ -249,7 +261,7 @@ class GenerationLimiter:
                 except (AttributeError, TypeError):
                     pass
             safe_error(
-                "generation_complete",
+                "llm_call_error",
                 stage=stage,
                 response_model=response_model.__name__,
                 elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
@@ -257,8 +269,10 @@ class GenerationLimiter:
                 error_type=type(error).__name__,
             )
             raise
+        finally:
+            reset_limiter_call(correlation)
         safe_event(
-            "generation_complete",
+            "llm_call_end",
             stage=stage,
             response_model=response_model.__name__,
             elapsed_ms=round((time.perf_counter() - started) * 1000, 2),

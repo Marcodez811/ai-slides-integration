@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Iterable, Sequence
 
 from presentation_pipeline.budgeting import (
@@ -50,13 +51,16 @@ async def _generate_chunk_digest(
         validate_digest_scope(digest, doc_id=window.doc_id, allowed_evidence_ids=set(window.evidence_ids))
     except ValueError as error:
         raise ChunkDigestValidationError("chunk digest cites evidence outside its window") from error
+    digest_tokens = limiter.token_counter.count_payload(digest.model_dump(mode="json"))
     safe_debug(
         "chunk_digest_complete",
         doc_id=window.doc_id,
         window_id=window.window_id,
         topic_count=len(digest.topics),
         key_fact_count=len(digest.key_facts),
-        estimated_digest_tokens=limiter.token_counter.count_payload(digest.model_dump(mode="json")),
+        window_input_tokens=window.estimated_tokens,
+        digest_output_estimated_tokens=digest_tokens,
+        compression_ratio=(digest_tokens / window.estimated_tokens) if window.estimated_tokens else 1.0,
     )
     return digest
 
@@ -87,11 +91,18 @@ async def generate_document_digest(
     elif token_counter is not None and token_counter is not limiter.token_counter:
         raise ValueError("token_counter must match the shared generation limiter")
     counter = limiter.token_counter
+    started = time.perf_counter()
     expected_doc_id = document_id(artifact)
     if getattr(index, "doc_id", None) != expected_doc_id:
         raise ValueError("artifact and index document IDs do not match")
     windows = build_evidence_windows(
         artifact, index, token_counter=counter, budget=budgets.window
+    )
+    safe_event(
+        "document_digest_start",
+        doc_id=expected_doc_id,
+        filename=getattr(artifact, "filename", None),
+        window_count=len(windows),
     )
     estimates = [window.estimated_tokens for window in windows]
     safe_event(
@@ -151,6 +162,14 @@ async def generate_document_digest(
     )
     if digest.doc_id != expected_doc_id:
         raise ValueError("digest document ID does not match artifact")
+    safe_event(
+        "document_digest_complete",
+        doc_id=expected_doc_id,
+        filename=getattr(artifact, "filename", None),
+        window_count=len(windows),
+        chunk_count=len(chunks),
+        elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
+    )
     return digest
 
 

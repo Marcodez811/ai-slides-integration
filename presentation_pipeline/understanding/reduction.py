@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from presentation_pipeline.budgeting import InputBudget, TokenCounter, estimate_request_tokens
-from presentation_pipeline.observability import safe_event
+from presentation_pipeline.observability import safe_debug, safe_event
 
 from .models import ChunkDigest, DigestFragment, DocumentDigest
 from .prompts import (
@@ -32,6 +32,8 @@ class ReductionNonReductionError(RuntimeError):
         estimates: dict[str, object],
         limit: int,
         rounds: int,
+        target_fragment_tokens: int | None = None,
+        max_compaction_rounds: int | None = None,
         reason: str,
     ) -> None:
         # Diagnostics deliberately retain identifiers and numeric estimates only;
@@ -48,8 +50,13 @@ class ReductionNonReductionError(RuntimeError):
             "limit_tokens": limit,
             "rounds": rounds,
             "compaction_rounds": rounds,
+            "compaction_rounds_at_level": rounds,
             "reason": reason,
         }
+        if target_fragment_tokens is not None:
+            self.metadata["target_fragment_tokens"] = target_fragment_tokens
+        if max_compaction_rounds is not None:
+            self.metadata["max_compaction_rounds_per_level"] = max_compaction_rounds
         super().__init__(f"reduction cannot make forward progress ({reason})")
 
 
@@ -120,6 +127,22 @@ def _fragment_token_estimates(
     return estimates
 
 
+def target_fragment_tokens_for_pairing(
+    *,
+    doc_id: str,
+    level: int,
+    token_counter: TokenCounter,
+    budget: InputBudget,
+) -> int:
+    """Derive a conservative pairable fragment target from the actual request shape."""
+    limit = _limit(budget)
+    wrapper_tokens = _count(
+        token_counter,
+        build_digest_reduction_input(doc_id=doc_id, level=level, fragments=[]),
+    )
+    return max(int(max(limit - wrapper_tokens, 1) * 0.45), 1)
+
+
 def _diagnostic_estimates(
     fragments: Sequence[DigestFragment],
     groups: Sequence[Sequence[DigestFragment]],
@@ -158,6 +181,8 @@ def _non_reduction_error(
     rounds: int,
     reason: str,
     estimates: dict[str, object] | None = None,
+    target_fragment_tokens: int | None = None,
+    max_compaction_rounds: int | None = None,
 ) -> ReductionNonReductionError:
     return ReductionNonReductionError(
         doc_id=doc_id,
@@ -174,6 +199,8 @@ def _non_reduction_error(
         limit=limit,
         rounds=rounds,
         reason=reason,
+        target_fragment_tokens=target_fragment_tokens,
+        max_compaction_rounds=max_compaction_rounds,
     )
 
 
@@ -266,7 +293,7 @@ async def reduce_chunk_digests(
             raise DigestProvenanceError("cannot reduce chunks from different documents")
     current = [fragment_from_chunk(chunk, ordinal) for ordinal, chunk in enumerate(chunks)]
     level = 0
-    compaction_rounds = 0
+    compaction_rounds_at_level = 0
     while True:
         groups = pack_digest_fragments(
             current,
@@ -274,8 +301,23 @@ async def reduce_chunk_digests(
             level=level,
             token_counter=token_counter,
             budget=budget,
-            rounds=compaction_rounds,
+            rounds=compaction_rounds_at_level,
         )
+        fragment_estimates = _fragment_token_estimates(current, token_counter)
+        target_tokens = target_fragment_tokens_for_pairing(
+            doc_id=doc_id, level=level, token_counter=token_counter, budget=budget
+        )
+        adjacent = [
+            _count(
+                token_counter,
+                build_digest_reduction_input(
+                    doc_id=doc_id,
+                    level=level,
+                    fragments=[_fragment_input(current[index]), _fragment_input(current[index + 1])],
+                ),
+            )
+            for index in range(len(current) - 1)
+        ]
         safe_event(
             "digest_reduction_level",
             doc_id=doc_id,
@@ -283,11 +325,27 @@ async def reduce_chunk_digests(
             fragment_count=len(current),
             group_count=len(groups),
             group_sizes=[len(group) for group in groups],
-            fragment_token_estimates=_fragment_token_estimates(current, token_counter),
+            fragment_token_estimates=fragment_estimates,
             input_limit_tokens=_limit(budget),
+            target_fragment_tokens=target_tokens,
+            adjacent_pair_count=len(adjacent),
+            adjacent_pair_fit_count=sum(tokens <= _limit(budget) for tokens in adjacent),
+        )
+        safe_debug(
+            "digest_reduction_pair_fit",
+            doc_id=doc_id,
+            level=level,
+            adjacent_pair_tokens=[
+                {"left": index, "right": index + 1, "tokens": tokens, "fits": tokens <= _limit(budget)}
+                for index, tokens in enumerate(adjacent)
+            ],
         )
         # A final response must be checked against the same full request shape.
         if len(groups) == 1:
+            safe_event(
+                "reduction_decision", doc_id=doc_id, level=level, decision="final_reduce",
+                reason="all_fragments_fit", fragment_count=len(current), group_count=1,
+            )
             payload = build_digest_reduction_input(
                 doc_id=doc_id, level=level, fragments=[_fragment_input(value) for value in current]
             )
@@ -298,6 +356,10 @@ async def reduce_chunk_digests(
             return result
         if len(groups) >= len(current):
             safe_event("compaction_required", doc_id=doc_id, level=level, fragment_count=len(current))
+            safe_event(
+                "reduction_decision", doc_id=doc_id, level=level, decision="compact_singletons",
+                reason="no_pair_fits", fragment_count=len(current), group_count=len(groups),
+            )
             if compact_invoke is None:
                 raise _non_reduction_error(
                     doc_id=doc_id,
@@ -306,10 +368,12 @@ async def reduce_chunk_digests(
                     groups=groups,
                     token_counter=token_counter,
                     limit=_limit(budget),
-                    rounds=compaction_rounds,
+                    rounds=compaction_rounds_at_level,
                     reason="singleton_group_deadlock",
+                    target_fragment_tokens=target_tokens,
+                    max_compaction_rounds=max_compaction_rounds,
                 )
-            if compaction_rounds >= max_compaction_rounds:
+            if compaction_rounds_at_level >= max_compaction_rounds:
                 raise _non_reduction_error(
                     doc_id=doc_id,
                     level=level,
@@ -317,15 +381,21 @@ async def reduce_chunk_digests(
                     groups=groups,
                     token_counter=token_counter,
                     limit=_limit(budget),
-                    rounds=compaction_rounds,
-                    reason="max_compaction_rounds",
+                    rounds=compaction_rounds_at_level,
+                    reason="max_compaction_rounds_at_level",
+                    target_fragment_tokens=target_tokens,
+                    max_compaction_rounds=max_compaction_rounds,
                 )
 
-            before = _fragment_token_estimates(current, token_counter)
+            before = fragment_estimates
 
             async def compact_fragment(ordinal: int, fragment: DigestFragment) -> DigestFragment:
                 payload = build_digest_compaction_input(
-                    doc_id=doc_id, level=level, fragment=_fragment_input(fragment)
+                    doc_id=doc_id,
+                    level=level,
+                    fragment=_fragment_input(fragment),
+                    current_fragment_tokens=before[ordinal],
+                    target_fragment_tokens=target_tokens,
                 )
                 result = await compact_invoke(payload, DigestFragment)
                 if not isinstance(result, DigestFragment):
@@ -336,7 +406,7 @@ async def reduce_chunk_digests(
                 return result.model_copy(
                     update={
                         "fragment_id": (
-                            f"fragment-c{compaction_rounds + 1}-l{level}-{ordinal:04d}"
+                            f"fragment-c{compaction_rounds_at_level + 1}-l{level}-{ordinal:04d}"
                         )
                     }
                 )
@@ -347,15 +417,31 @@ async def reduce_chunk_digests(
                 )
             )
             after = _fragment_token_estimates(compacted, token_counter)
-            compaction_rounds += 1
+            compaction_rounds_at_level += 1
+            for ordinal, (before_tokens, after_tokens) in enumerate(zip(before, after, strict=True)):
+                safe_debug(
+                    "digest_compaction_fragment",
+                    doc_id=doc_id,
+                    level=level,
+                    compaction_round=compaction_rounds_at_level,
+                    fragment_ordinal=ordinal,
+                    before_tokens=before_tokens,
+                    after_tokens=after_tokens,
+                    target_tokens=target_tokens,
+                    reduction_percent=(100 * (1 - after_tokens / before_tokens)) if before_tokens else 0.0,
+                    target_met=after_tokens <= target_tokens,
+                )
             safe_event(
                 "digest_compaction_complete",
                 doc_id=doc_id,
                 level=level,
-                compaction_round=compaction_rounds,
+                compaction_round=compaction_rounds_at_level,
+                fragment_count=len(compacted),
                 before_total_tokens=sum(before),
                 after_total_tokens=sum(after),
                 size_reduction_ratio=(sum(after) / sum(before)) if sum(before) else 1.0,
+                target_fragment_tokens=target_tokens,
+                target_met_count=sum(tokens <= target_tokens for tokens in after),
             )
             if sum(after) >= sum(before):
                 estimates = _diagnostic_estimates(
@@ -380,14 +466,33 @@ async def reduce_chunk_digests(
                     groups=groups,
                     token_counter=token_counter,
                     limit=_limit(budget),
-                    rounds=compaction_rounds,
+                    rounds=compaction_rounds_at_level,
                     reason="compaction_made_no_token_progress",
                     estimates=estimates,
+                    target_fragment_tokens=target_tokens,
+                    max_compaction_rounds=max_compaction_rounds,
                 )
             current = compacted
+            safe_event(
+                "reduction_decision", doc_id=doc_id, level=level, decision="repack_after_compaction",
+                reason="token_progress", fragment_count=len(current), group_count=len(groups),
+            )
             continue
 
         async def reduce_group(ordinal: int, group: list[DigestFragment]) -> DigestFragment:
+            if len(group) == 1:
+                fragment = group[0]
+                if fragment.doc_id != doc_id:
+                    raise DigestProvenanceError("singleton reduction fragment has another document ID")
+                safe_event(
+                    "reduction_singleton_carried_forward",
+                    doc_id=doc_id,
+                    level=level,
+                    group_ordinal=ordinal,
+                    fragment_id=fragment.fragment_id,
+                    estimated_tokens=_fragment_token_estimates([fragment], token_counter)[0],
+                )
+                return fragment.model_copy(update={"fragment_id": f"fragment-l{level + 1}-{ordinal:04d}"})
             payload = build_digest_reduction_input(
                 doc_id=doc_id, level=level, fragments=[_fragment_input(value) for value in group]
             )
@@ -397,7 +502,24 @@ async def reduce_chunk_digests(
             # Model-visible fragment IDs must be transport IDs, never citations.
             result = result.model_copy(update={"fragment_id": f"fragment-l{level + 1}-{ordinal:04d}"})
             validate_digest_scope(result, doc_id=doc_id, allowed_evidence_ids=evidence_scope(group))
+            input_tokens = _count(token_counter, payload)
+            merged_tokens = _fragment_token_estimates([result], token_counter)[0]
+            safe_event(
+                "digest_reduction_merge",
+                doc_id=doc_id,
+                level=level,
+                group_ordinal=ordinal,
+                input_group_tokens=input_tokens,
+                merged_fragment_tokens=merged_tokens,
+                compression_ratio=(merged_tokens / input_tokens) if input_tokens else 1.0,
+                target_pairable_tokens=target_tokens,
+            )
             return result
 
+        safe_event(
+            "reduction_decision", doc_id=doc_id, level=level, decision="merge_groups",
+            reason="at_least_one_pair_fits", fragment_count=len(current), group_count=len(groups),
+        )
         current = list(await asyncio.gather(*(reduce_group(ordinal, group) for ordinal, group in enumerate(groups))))
         level += 1
+        compaction_rounds_at_level = 0

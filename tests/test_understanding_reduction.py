@@ -10,6 +10,7 @@ from presentation_pipeline.understanding.reduction import (
     DigestProvenanceError,
     ReductionNonReductionError,
     reduce_chunk_digests,
+    target_fragment_tokens_for_pairing,
     validate_digest_scope,
 )
 from presentation_pipeline.understanding.service import generate_document_digest
@@ -77,9 +78,9 @@ def test_reduction_recurses_in_deterministic_groups() -> None:
             [_chunk(0), _chunk(1), _chunk(2)], token_counter=Counter(), budget=InputBudget(max_input_tokens=250), invoke=invoke
         )
     )
-    assert [response for response, _ in calls] == [DigestFragment, DigestFragment, DocumentDigest]
+    assert [response for response, _ in calls] == [DigestFragment, DocumentDigest]
     assert calls[0][1] == ["fragment-window-0000", "fragment-window-0001"]
-    assert calls[1][1] == ["fragment-window-0002"]
+    assert calls[1][1] == ["fragment-l1-0000", "fragment-l1-0001"]
     assert {evidence_id for ref in result.evidence_refs() for evidence_id in ref.evidence_ids} == {"e-0", "e-1", "e-2"}
 
 
@@ -201,8 +202,73 @@ def test_compaction_round_limit_is_enforced() -> None:
             compact_invoke=compact, max_compaction_rounds=1,
         ))
     assert calls == 2
-    assert raised.value.metadata["reason"] == "max_compaction_rounds"
+    assert raised.value.metadata["reason"] == "max_compaction_rounds_at_level"
     assert raised.value.metadata["rounds"] == 1
+
+
+def test_compaction_target_is_budget_derived_and_in_payload() -> None:
+    class Counter:
+        def count_text(self, text): return 1
+        def count_payload(self, payload):
+            if "summary" in payload: return len(payload["summary"])
+            return 5 + sum(len(item.get("summary", "")) for item in payload.get("fragments", [payload.get("fragment", {})]))
+
+    counter = Counter()
+    small = target_fragment_tokens_for_pairing(
+        doc_id="doc-a", level=0, token_counter=counter, budget=InputBudget(max_input_tokens=30)
+    )
+    large = target_fragment_tokens_for_pairing(
+        doc_id="doc-a", level=0, token_counter=counter, budget=InputBudget(max_input_tokens=60)
+    )
+    assert 0 < small < large
+    payloads = []
+
+    async def invoke(payload, response_model):
+        refs = [evidence_id for fragment in payload["fragments"] for fact in fragment["key_facts"] for ref in fact["evidence"] for evidence_id in ref["evidence_ids"]]
+        return DocumentDigest(doc_id="doc-a", summary="final", key_facts=[KeyFact(claim="x", evidence=[EvidenceRef(doc_id="doc-a", evidence_ids=refs)])])
+
+    async def compact(payload, _response_model):
+        payloads.append(payload)
+        fragment = payload["fragment"]
+        return DigestFragment(doc_id="doc-a", fragment_id="compact", summary="x", key_facts=fragment["key_facts"])
+
+    asyncio.run(reduce_chunk_digests(
+        [_chunk(0).model_copy(update={"summary": "x" * 20}), _chunk(1).model_copy(update={"summary": "x" * 20})],
+        token_counter=counter, budget=InputBudget(max_input_tokens=30), invoke=invoke, compact_invoke=compact,
+    ))
+    assert payloads
+    compaction = payloads[0]["compaction"]
+    assert compaction["current_fragment_tokens"] == 20
+    assert compaction["target_fragment_tokens"] == small
+
+
+def test_compaction_round_limit_resets_after_successful_merge() -> None:
+    class Counter:
+        def count_text(self, text): return 0
+        def count_payload(self, payload):
+            if "summary" in payload: return len(payload["summary"])
+            return sum(len(item.get("summary", "")) for item in payload.get("fragments", [payload.get("fragment", {})]))
+
+    compaction_levels: list[int] = []
+
+    async def invoke(payload, response_model):
+        refs = [evidence_id for fragment in payload["fragments"] for fact in fragment["key_facts"] for ref in fact["evidence"] for evidence_id in ref["evidence_ids"]]
+        if response_model is DigestFragment:
+            return DigestFragment(doc_id="doc-a", fragment_id="merged", summary="x" * 10, key_facts=[KeyFact(claim="x", evidence=[EvidenceRef(doc_id="doc-a", evidence_ids=refs)])])
+        return DocumentDigest(doc_id="doc-a", summary="final", key_facts=[KeyFact(claim="x", evidence=[EvidenceRef(doc_id="doc-a", evidence_ids=refs)])])
+
+    async def compact(payload, _response_model):
+        compaction_levels.append(payload["compaction"]["level"])
+        fragment = payload["fragment"]
+        return DigestFragment(doc_id="doc-a", fragment_id="compact", summary="x" * 5, key_facts=fragment["key_facts"])
+
+    result = asyncio.run(reduce_chunk_digests(
+        [_chunk(i).model_copy(update={"summary": "x" * 10}) for i in range(4)],
+        token_counter=Counter(), budget=InputBudget(max_input_tokens=11), invoke=invoke,
+        compact_invoke=compact, max_compaction_rounds=1,
+    ))
+    assert result.doc_id == "doc-a"
+    assert set(compaction_levels) == {0, 1}
 
 
 def test_document_generation_uses_chunk_then_final_reduction() -> None:

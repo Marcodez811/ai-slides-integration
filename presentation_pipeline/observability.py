@@ -4,13 +4,122 @@ from __future__ import annotations
 
 import sys
 import time
+from contextvars import ContextVar, Token
 from contextlib import AbstractContextManager
+from dataclasses import dataclass
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from loguru import logger
+
+
+@dataclass(frozen=True, slots=True)
+class _CallCorrelation:
+    stage: str
+    response_model: str
+    estimated_input_tokens: int
+
+
+_call_correlation: ContextVar[_CallCorrelation | None] = ContextVar(
+    "presentation_llm_call_correlation", default=None
+)
+
+
+class RunMetrics:
+    """Small in-memory, content-free counters for the active CLI run."""
+
+    def __init__(self) -> None:
+        self.provider_calls = 0
+        self.provider_input_tokens = 0
+        self.provider_output_tokens = 0
+        self.provider_latency_ms = 0.0
+        self.calls_by_response_model: dict[str, int] = {}
+        self.calls_by_stage: dict[str, int] = {}
+        self.estimated_to_actual_ratios: list[float] = []
+        self.document_count = 0
+        self.window_count = 0
+        self.chunk_digest_count = 0
+        self.semantic_slide_count = 0
+        self.physical_slide_count = 0
+
+    def record_limiter_call(self, *, stage: str) -> None:
+        self.calls_by_stage[stage] = self.calls_by_stage.get(stage, 0) + 1
+
+    def record_provider(self, values: dict[str, Any]) -> None:
+        self.provider_calls += 1
+        model = values.get("response_model")
+        if isinstance(model, str):
+            self.calls_by_response_model[model] = self.calls_by_response_model.get(model, 0) + 1
+        for key, destination in (("input_tokens", "provider_input_tokens"), ("output_tokens", "provider_output_tokens")):
+            value = values.get(key)
+            if isinstance(value, int) and value >= 0:
+                setattr(self, destination, getattr(self, destination) + value)
+        latency = values.get("latency_ms")
+        if isinstance(latency, (int, float)) and latency >= 0:
+            self.provider_latency_ms += float(latency)
+
+    def record_estimate_ratio(self, ratio: float) -> None:
+        if ratio >= 0:
+            self.estimated_to_actual_ratios.append(ratio)
+
+    def record_event(self, event: str, fields: dict[str, object]) -> None:
+        if event == "document_digest_start":
+            self.document_count += 1
+            windows = fields.get("window_count")
+            if isinstance(windows, int) and windows >= 0:
+                self.window_count += windows
+        elif event == "chunk_digest_complete":
+            self.chunk_digest_count += 1
+        elif event == "run_complete":
+            for key in ("semantic_slide_count", "physical_slide_count"):
+                value = fields.get(key)
+                if isinstance(value, int) and value >= 0:
+                    setattr(self, key, value)
+
+    def summary(self) -> dict[str, object]:
+        ratios = sorted(self.estimated_to_actual_ratios)
+        return {
+            "provider_call_count": self.provider_calls,
+            "actual_provider_input_tokens": self.provider_input_tokens,
+            "actual_provider_output_tokens": self.provider_output_tokens,
+            "provider_latency_ms": round(self.provider_latency_ms, 2),
+            "calls_by_response_model": dict(self.calls_by_response_model),
+            "calls_by_stage": dict(self.calls_by_stage),
+            "reduction_call_count": self.calls_by_stage.get("document_digest_reduction", 0),
+            "compaction_call_count": self.calls_by_stage.get("document_digest_compaction", 0),
+            "document_count": self.document_count,
+            "window_count": self.window_count,
+            "chunk_digest_count": self.chunk_digest_count,
+            "semantic_slide_count": self.semantic_slide_count,
+            "physical_slide_count": self.physical_slide_count,
+            "average_estimate_to_actual_ratio": (sum(ratios) / len(ratios)) if ratios else None,
+            "median_estimate_to_actual_ratio": (ratios[len(ratios) // 2] if ratios else None),
+            "max_estimate_to_actual_ratio": (max(ratios) if ratios else None),
+        }
+
+
+_active_metrics: RunMetrics | None = None
+
+
+def run_metrics() -> RunMetrics | None:
+    return _active_metrics
+
+
+def console_formatter(record: dict[str, Any]) -> str:
+    """Render safe Loguru extras on stderr without serializing content blobs."""
+    extra = record["extra"]
+    event = extra.get("event")
+    fields = []
+    for key, value in extra.items():
+        if key in {"event", "run_id"} or value is None:
+            continue
+        rendered = _console_value(value)
+        if rendered is not None:
+            fields.append(f"{key}={rendered}")
+    suffix = (" | " + " ".join(fields)) if fields else ""
+    return "{time:HH:mm:ss} | {level} | " + str(event or "{message}") + suffix + "\n"
 
 
 def new_run_id() -> str:
@@ -30,8 +139,10 @@ def configure_run_logging(
     log_dir = output.parent / ".presentation-logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     path = log_dir / f"{output.name}-{identifier}.jsonl"
+    global _active_metrics
+    _active_metrics = RunMetrics()
     logger.remove()
-    logger.add(sys.stderr, level=level, format="{time:HH:mm:ss} | {level} | {message}")
+    logger.add(sys.stderr, level=level, format=console_formatter)
     logger.add(path, level="DEBUG", serialize=True, encoding="utf-8")
     logger.configure(extra={"run_id": identifier})
     logger.bind(run_id=identifier).info("run_logging_configured log_path={log_path}", log_path=str(path))
@@ -41,6 +152,8 @@ def configure_run_logging(
 def safe_event(event: str, **fields: object) -> None:
     """Emit only metadata-shaped fields; discard arbitrary content containers."""
     safe: dict[str, object] = {key: _safe_value(value) for key, value in fields.items()}
+    if _active_metrics is not None:
+        _active_metrics.record_event(event, safe)
     logger.bind(event=event, **safe).info(event)
 
 
@@ -51,6 +164,8 @@ def safe_error(event: str, **fields: object) -> None:
 
 def safe_debug(event: str, **fields: object) -> None:
     safe: dict[str, object] = {key: _safe_value(value) for key, value in fields.items()}
+    if _active_metrics is not None:
+        _active_metrics.record_event(event, safe)
     logger.bind(event=event, **safe).debug(event)
 
 
@@ -98,7 +213,58 @@ def telemetry_logger(event: object) -> None:
             )
             if hasattr(event, name)
         }
+    if _active_metrics is not None:
+        _active_metrics.record_provider(values)
     safe_event("provider_call", **values)
+    correlation = _call_correlation.get()
+    actual = values.get("input_tokens")
+    if correlation is not None and isinstance(actual, int) and actual > 0:
+        ratio = correlation.estimated_input_tokens / actual
+        if _active_metrics is not None:
+            _active_metrics.record_estimate_ratio(ratio)
+        safe_event(
+            "estimated_vs_actual_tokens",
+            stage=correlation.stage,
+            response_model=correlation.response_model,
+            estimated_input_tokens=correlation.estimated_input_tokens,
+            actual_input_tokens=actual,
+            estimate_to_actual_ratio=ratio,
+        )
+
+
+def record_limiter_call(*, stage: str) -> None:
+    if _active_metrics is not None:
+        _active_metrics.record_limiter_call(stage=stage)
+
+
+def bind_limiter_call(
+    *, stage: str, response_model: str, estimated_input_tokens: int
+) -> Token[_CallCorrelation | None]:
+    """Bind provider telemetry to the active async task, never a global queue."""
+    return _call_correlation.set(
+        _CallCorrelation(
+            stage=stage,
+            response_model=response_model,
+            estimated_input_tokens=estimated_input_tokens,
+        )
+    )
+
+
+def reset_limiter_call(token: Token[_CallCorrelation | None]) -> None:
+    _call_correlation.reset(token)
+
+
+def _console_value(value: object) -> str | None:
+    if isinstance(value, (str, int, float, bool)):
+        return str(value)
+    if isinstance(value, list) and all(isinstance(item, (str, int, float, bool)) for item in value):
+        return "[" + ",".join(str(item) for item in value[:20]) + "]"
+    if isinstance(value, dict) and all(
+        isinstance(key, str) and isinstance(item, (str, int, float, bool))
+        for key, item in value.items()
+    ):
+        return "{" + ",".join(f"{key}:{item}" for key, item in list(value.items())[:8]) + "}"
+    return None
 
 
 def _safe_value(value: object) -> object:

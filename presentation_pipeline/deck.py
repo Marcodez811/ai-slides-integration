@@ -18,7 +18,7 @@ from presentation_pipeline.artifacts import write_outline_json, write_presentati
 from presentation_pipeline.generation import StructuredGenerator
 from presentation_pipeline.images import ImageGenerator
 from presentation_pipeline.pipeline import generate_plan
-from presentation_pipeline.observability import new_run_id, safe_event, stage_timer
+from presentation_pipeline.observability import new_run_id, run_metrics, safe_event, stage_timer
 from presentation_pipeline.planning.models import PresentationRequirements, SlidePurpose
 from presentation_pipeline.results import PresentationPlanningResult
 from presentation_pipeline.synthesis import (
@@ -231,6 +231,40 @@ async def generate_deck(
         _write_json(report[0], report[1], overwrite=True)
         safe_event("deck_failed", run_id=run_id, failed_stage=failed_stage, error_type=type(error).__name__)
         raise
+    metrics = run_metrics()
+    if metrics is not None:
+        metrics.semantic_slide_count = len(content.slides)
+        metrics.physical_slide_count = len(layout.slides)
+    safe_event(
+        "run_complete",
+        run_id=run_id,
+        document_count=len(input_paths),
+        semantic_slide_count=len(content.slides),
+        physical_slide_count=len(layout.slides),
+        elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
+        metrics=metrics.summary() if metrics is not None else {},
+    )
+    if metrics is not None:
+        summary = metrics.summary()
+        safe_event(
+            "run_summary",
+            documents=summary["document_count"],
+            windows=summary["window_count"],
+            chunk_digests=summary["chunk_digest_count"],
+            llm_calls=summary["provider_call_count"],
+            reduction_calls=summary["reduction_call_count"],
+            compaction_calls=summary["compaction_call_count"],
+            actual_input_tokens=summary["actual_provider_input_tokens"],
+            actual_output_tokens=summary["actual_provider_output_tokens"],
+            provider_latency_ms=summary["provider_latency_ms"],
+            semantic_slides=summary["semantic_slide_count"],
+            physical_slides=summary["physical_slide_count"],
+            average_estimate_to_actual_ratio=summary["average_estimate_to_actual_ratio"],
+            median_estimate_to_actual_ratio=summary["median_estimate_to_actual_ratio"],
+            max_estimate_to_actual_ratio=summary["max_estimate_to_actual_ratio"],
+            calls_by_response_model=summary["calls_by_response_model"],
+            calls_by_stage=summary["calls_by_stage"],
+        )
     return DeckGenerationResult(
         planning=plan,
         content=content,
@@ -495,7 +529,8 @@ def _failure_report(
     directory = root.parent / ".presentation-failures"
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{root.name}-{run_id}.json"
-    return path, {
+    metadata = getattr(error, "metadata", None)
+    report: dict[str, object] = {
         "run_id": run_id,
         "success": False,
         "failed_stage": failed_stage,
@@ -506,6 +541,25 @@ def _failure_report(
         "log_path": log_path,
         "failed_artifacts_path": str(failed_artifacts_path) if failed_artifacts_path else None,
     }
+    if isinstance(metadata, dict):
+        # Domain errors are responsible for content-free metadata. Bound this
+        # final persistence boundary defensively to simple JSON-safe values.
+        report["error_metadata"] = _safe_error_metadata(metadata)
+    return path, report
+
+
+def _safe_error_metadata(metadata: dict[str, object]) -> dict[str, object]:
+    safe: dict[str, object] = {}
+    for key, value in metadata.items():
+        if isinstance(value, (bool, int, float)) or value is None:
+            safe[key] = value
+        elif isinstance(value, list) and all(isinstance(item, (bool, int, float)) for item in value):
+            safe[key] = value[:100]
+        elif isinstance(value, dict):
+            safe[key] = _safe_error_metadata(value)
+        elif key in {"doc_id", "reason"} and isinstance(value, str):
+            safe[key] = value[:128]
+    return safe
 
 
 def _failure_stage(default: str, error: BaseException) -> str:
