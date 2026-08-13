@@ -34,15 +34,15 @@ def build_evidence_selection_input(
         if isinstance(candidates, CandidateEvidenceSet)
         else candidates
     )
-    candidate_doc_ids = {item.doc_id for item in items}
+    candidate_ids_by_document = _evidence_ids_by_document(items)
     return {
         "requirements": requirements.model_dump(mode="json"),
         # The final selector needs only document context for documents represented
         # by its bounded shortlist. Preserve supplied digest order.
         "documents": [
-            digest.model_dump(mode="json")
+            digest.scoped_to(candidate_ids_by_document[digest.doc_id]).model_dump(mode="json")
             for digest in digests
-            if digest.doc_id in candidate_doc_ids
+            if digest.doc_id in candidate_ids_by_document
         ],
         "candidate_evidence": [_compact_candidate_item(item, indexes) for item in items],
     }
@@ -85,13 +85,13 @@ def build_outline_input(
         if candidates is not None
         else {}
     )
-    selected_doc_ids = {item.doc_id for item in selection.selected}
+    selected_ids_by_document = _evidence_ids_by_document(selection.selected)
     return {
         "requirements": requirements.model_dump(mode="json"),
         "documents": [
-            digest.model_dump(mode="json")
+            digest.scoped_to(selected_ids_by_document[digest.doc_id]).model_dump(mode="json")
             for digest in digests
-            if digest.doc_id in selected_doc_ids
+            if digest.doc_id in selected_ids_by_document
         ],
         "selected_evidence": [
             _compact_selected_item(
@@ -115,6 +115,18 @@ def _document_id(index: object) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError("document index has no doc_id")
     return value
+
+
+def _evidence_ids_by_document(items: object) -> dict[str, set[str]]:
+    """Group bounded evidence identities without changing their input ordering."""
+    result: dict[str, set[str]] = {}
+    for item in items:
+        doc_id = getattr(item, "doc_id", None)
+        evidence_id = getattr(item, "evidence_id", None)
+        if not isinstance(doc_id, str) or not isinstance(evidence_id, str):
+            raise ValueError("evidence item is malformed")
+        result.setdefault(doc_id, set()).add(evidence_id)
+    return result
 
 
 def _compact_selected_item(

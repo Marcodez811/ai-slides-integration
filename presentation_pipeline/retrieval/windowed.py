@@ -154,7 +154,7 @@ class WindowedLLMEvidenceRetriever:
                     safe_event(
                         "candidate_over_limit_cap",
                         initial_candidate_count=initial_count,
-                        final_candidate_count=len(candidates),
+                        final_candidate_count=len(hydrated),
                         global_candidate_cap=maximum,
                         reduction_rounds=round_number,
                     )
@@ -220,7 +220,14 @@ class WindowedLLMEvidenceRetriever:
             EVIDENCE_SELECTION_PROMPT,
             build_evidence_selection_input,
         )
+        # Never return a descriptor without retained transport. Prompt builders
+        # intentionally have a canonical-index fallback for direct callers, but
+        # using it here would defeat the bounded transport calculation above.
         hydrated_only = [item for item in retained if item.transport_contents()]
+        if not hydrated_only:
+            raise CandidateRetrievalError(
+                "candidate hydration retained no transport for evidence selection"
+            )
         estimated_tokens = estimate_request_tokens(
             EVIDENCE_SELECTION_PROMPT,
             build_evidence_selection_input(
@@ -231,12 +238,17 @@ class WindowedLLMEvidenceRetriever:
         safe_event(
             "candidate_selection_hydration",
             candidate_count=len(candidates),
+            input_candidate_count=len(candidates),
+            hydrated_candidate_count=len(hydrated_only),
+            dropped_candidate_count=len(candidates) - len(hydrated_only),
             available_slice_count=available_slice_count,
             dropped_slice_count=dropped_slice_count,
-            retained_slice_count=sum(len(candidate.transport_contents()) for candidate in retained),
+            retained_slice_count=sum(
+                len(candidate.transport_contents()) for candidate in hydrated_only
+            ),
             estimated_selection_tokens=estimated_tokens,
         )
-        return retained
+        return hydrated_only
 
     def _discovery_transport_budget(
         self,

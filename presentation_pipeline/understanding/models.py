@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from pydantic import ConfigDict, Field, field_validator
 
 from presentation_pipeline.common.models import PipelineModel
@@ -58,6 +58,59 @@ class DocumentDigest(UnderstandingModel):
             for fact in self.key_facts
             for reference in fact.evidence
         ]
+
+    def scoped_to(self, evidence_ids: Iterable[str]) -> DocumentDigest:
+        """Return a copy containing references limited to ``evidence_ids``.
+
+        The document-level prose remains useful planning context, but references
+        outside the caller's current evidence scope must not be exposed to a
+        downstream model.  Rebuilding each nested value keeps this operation
+        non-mutating even though their list fields are mutable containers.
+        """
+        if isinstance(evidence_ids, str):
+            raise TypeError("evidence_ids must be an iterable of strings, not a string")
+
+        allowed = set(evidence_ids)
+        if any(not isinstance(evidence_id, str) for evidence_id in allowed):
+            raise TypeError("evidence_ids must contain only strings")
+
+        def scope_references(references: list[EvidenceRef]) -> list[EvidenceRef]:
+            return [
+                EvidenceRef(
+                    doc_id=reference.doc_id,
+                    evidence_ids=[
+                        evidence_id
+                        for evidence_id in reference.evidence_ids
+                        if evidence_id in allowed
+                    ],
+                )
+                for reference in references
+                if any(evidence_id in allowed for evidence_id in reference.evidence_ids)
+            ]
+
+        topics = [
+            TopicDigest(
+                topic=topic.topic,
+                summary=topic.summary,
+                evidence=references,
+            )
+            for topic in self.topics
+            if (references := scope_references(topic.evidence))
+        ]
+        key_facts = [
+            KeyFact(
+                claim=fact.claim,
+                evidence=references,
+            )
+            for fact in self.key_facts
+            if (references := scope_references(fact.evidence))
+        ]
+        return DocumentDigest(
+            doc_id=self.doc_id,
+            summary=self.summary,
+            topics=topics,
+            key_facts=key_facts,
+        )
 
 
 class DigestFragment(UnderstandingModel):
