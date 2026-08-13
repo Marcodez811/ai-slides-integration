@@ -25,9 +25,11 @@ class EvidenceRef(PipelineModel):
 
     @field_validator("evidence_ids")
     @classmethod
-    def _evidence_ids_are_unique_and_nonempty(cls, values: list[str]) -> list[str]:
+    def _evidence_ids_are_unique_and_nonempty(
+        cls,
+        values: list[str],
+    ) -> list[str]:
         if any(not value.strip() for value in values):
             raise ValueError("evidence IDs must not be blank")
-        if len(set(values)) != len(values):
-            raise ValueError("evidence IDs must be unique within a reference")
-        return values
+
+        return list(dict.fromkeys(values))

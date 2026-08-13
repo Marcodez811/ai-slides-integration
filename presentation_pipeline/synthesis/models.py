@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
@@ -85,10 +85,14 @@ class EquationContent(PipelineModel):
     _evidence_id_is_nonempty = field_validator("evidence_id")(_nonempty)
 
 
-SlideElement = Annotated[
-    TextContent | BulletListContent | ChartContent | TableContent | ImageContent | EquationContent,
-    Field(discriminator="kind"),
-]
+SlideElement = (
+    TextContent
+    | BulletListContent
+    | ChartContent
+    | TableContent
+    | ImageContent
+    | EquationContent
+)
 
 
 class SlideContent(PipelineModel):

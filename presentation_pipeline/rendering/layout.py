@@ -21,7 +21,6 @@ from .models import (
     RenderInputResult,
     ResolvedElement,
     SourceAttribution,
-    TableCell,
     TablePayload,
 )
 
@@ -169,9 +168,24 @@ def _build_slide_pages(context: SlideContext, content: SlideContent, values: Seq
                 for item in positions
             ]
         layout = PhysicalSlideLayout(slide_id=physical_id, physical_slide_id=physical_id, semantic_slide_id=content.slide_id, continuation_index=page_number - 1, is_continuation=page_number > 1, page_number=page_number, page_count=page_count, archetype=archetype, elements=positions, source_attributions=attributions, theme=active_theme)
-        errors = [item for item in validate_layout(layout) if item.severity == "error"]
+        errors = [
+            item
+            for item in validate_layout(layout)
+            if item.severity == "error"
+        ]
+
         if errors:
-            raise LayoutValidationError("; ".join(item.message for item in errors))
+            details = "; ".join(
+                f"{item.code}: {item.message}"
+                for item in errors
+            )
+            raise LayoutValidationError(
+                f"slide={content.slide_id} "
+                f"page={page_number}/{page_count} "
+                f"archetype={archetype.value}: "
+                f"{details}"
+            )
+
         pages.append(layout)
     return pages
 
@@ -316,9 +330,79 @@ def _split_overlong(value: str, limit: int) -> list[str]:
 def _layout_positions(context: SlideContext, resolved: list[ResolvedElement], archetype: LayoutArchetype, theme: ExecutivePolicyTheme, attributions: list[SourceAttribution]) -> list[PositionedElement]:
     title = context.slide.title
     if archetype == LayoutArchetype.TITLE:
-        positions = [_text_position(None, "title", "title", title, Box(x=0.85, y=1.2, width=11.55, height=0.95), 38), _text_position(None, "subtitle", "subtitle", context.presentation_objective, Box(x=0.88, y=2.35, width=8.5, height=0.7), 18), _text_position(None, "text", "body", context.slide.message, Box(x=0.88, y=3.25, width=8.2, height=1.25), 18)]
+        title_box = Box(
+            x=0.85,
+            y=1.2,
+            width=11.55,
+            height=0.95,
+        )
+
+        title_font = _fit_text_font(
+            title,
+            title_box,
+            preferred=38,
+            minimum=28,
+        )
+
+        positions = [
+            _text_position(
+                None,
+                "title",
+                "title",
+                title,
+                title_box,
+                title_font,
+            ),
+            _text_position(
+                None,
+                "subtitle",
+                "subtitle",
+                context.presentation_objective,
+                Box(x=0.88, y=2.35, width=8.5, height=0.7),
+                18,
+            ),
+            _text_position(
+                None,
+                "text",
+                "body",
+                context.slide.message,
+                Box(x=0.88, y=3.25, width=8.2, height=1.25),
+                18,
+            ),
+        ]
     elif archetype == LayoutArchetype.SECTION_DIVIDER:
-        positions = [_text_position(None, "title", "section_title", title, Box(x=0.9, y=2.15, width=10.7, height=0.85), 34), _text_position(None, "subtitle", "subtitle", context.section_purpose, Box(x=0.92, y=3.15, width=9.0, height=0.65), 18)]
+        title_box = Box(
+            x=0.9,
+            y=2.15,
+            width=10.7,
+            height=0.85,
+        )
+
+        title_font = _fit_text_font(
+            title,
+            title_box,
+            preferred=34,
+            minimum=28,
+        )
+
+        positions = [
+            _text_position(
+                None,
+                "title",
+                "section_title",
+                title,
+                title_box,
+                title_font,
+            ),
+            _text_position(
+                None,
+                "subtitle",
+                "subtitle",
+                context.section_purpose,
+                Box(x=0.92, y=3.15, width=9.0, height=0.65),
+                18,
+            ),
+        ]
     else:
         positions = [_text_position(None, "title", "title", title, Box(x=0.55, y=0.42, width=12.15, height=0.62), 28)]
         images = [item for item in resolved if item.kind == "image"]
@@ -380,6 +464,25 @@ def _payload_positions(payloads: list[ResolvedElement], area: Box, theme: Execut
     height = area.height / len(payloads)
     return [_payload_position(payload, payload.kind, Box(x=area.x, y=area.y + ordinal * height, width=area.width, height=height - (0.12 if len(payloads) > 1 else 0)), _body_font(len(payloads), theme)) for ordinal, payload in enumerate(payloads)]
 
+def _fit_text_font(
+    text: str,
+    box: Box,
+    *,
+    preferred: float,
+    minimum: float,
+) -> float:
+    """Choose the largest permitted font that fits the allocated box."""
+    size = preferred
+
+    while size > minimum:
+        capacity_units = text_capacity(box, size) * 0.52
+
+        if text_width_units(text) <= capacity_units:
+            return size
+
+        size -= 1
+
+    return minimum
 
 def _body_font(count: int, theme: ExecutivePolicyTheme) -> float:
     return max(18, theme.minimum_body_font_pt, min(theme.maximum_body_font_pt, 20 - (count - 1) * 2))

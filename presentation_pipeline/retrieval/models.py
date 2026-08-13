@@ -125,6 +125,35 @@ def _dedupe_transport_contents(
         unique.append((index if isinstance(index, int) and index >= 0 else arrival, arrival, content))
     return [content for _, _, content in sorted(unique, key=lambda item: (item[0], item[1]))]
 
+class CandidateIdentity(PipelineModel):
+    """One candidate identity selected during reduction."""
+
+    doc_id: str
+    evidence_id: str
+
+    _doc_id_is_nonempty = field_validator("doc_id")(_nonempty)
+    _evidence_id_is_nonempty = field_validator("evidence_id")(_nonempty)
+
+
+class CandidateReductionSelection(PipelineModel):
+    """Provider response for candidate reduction.
+
+    Reduction selects existing candidates by identity only. Metadata such as
+    reason, score, and transport content remains owned by the original
+    CandidateEvidence.
+    """
+
+    candidates: list[CandidateIdentity] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _identities_are_unique(self) -> "CandidateReductionSelection":
+        identities = [
+            (item.doc_id, item.evidence_id)
+            for item in self.candidates
+        ]
+        if len(identities) != len(set(identities)):
+            raise ValueError("candidate reduction identities must be unique")
+        return self
 
 class CandidateEvidenceSet(PipelineModel):
     """Deterministically ordered, globally bounded retrieval shortlist."""
