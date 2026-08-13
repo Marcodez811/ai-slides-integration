@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from math import isfinite
+from numbers import Real
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeVar
@@ -29,6 +31,15 @@ def _input_budget(name: str, value: object) -> InputBudget:
     if not isinstance(value, InputBudget):
         raise TypeError(f"{name} must be an InputBudget")
     return value
+
+
+def _ratio(name: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f"{name} must be a number")
+    result = float(value)
+    if not isfinite(result) or not 0 < result < 1:
+        raise ValueError(f"{name} must be greater than zero and less than one")
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,11 +114,13 @@ class RetrievalBudget:
     selection_budget: InputBudget = _default_stage()
     max_candidates_per_window: int = 24
     max_global_candidates: int = 96
+    reduction_keep_ratio: float = 0.5
 
     def __post_init__(self) -> None:
         _input_budget("request_budget", self.request_budget)
         _input_budget("reduction_budget", self.reduction_budget)
         _input_budget("selection_budget", self.selection_budget)
+        _ratio("reduction_keep_ratio", self.reduction_keep_ratio)
         _integer(
             "max_candidates_per_window",
             self.max_candidates_per_window,

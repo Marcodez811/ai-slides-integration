@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from collections.abc import Sequence
+from copy import deepcopy
+from dataclasses import dataclass
 import json
+from math import isfinite
+from numbers import Real
 
 from pydantic import Field, PrivateAttr, field_validator, model_validator
 
@@ -17,6 +20,69 @@ def _nonempty(value: str) -> str:
     return value
 
 
+def _strict_nonblank(name: str, value: object) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string")
+    if not value.strip():
+        raise ValueError(f"{name} must not be blank")
+    return value
+
+
+def _finite_score(name: str, value: object | None) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f"{name} must be a number or None")
+    result = float(value)
+    if not isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
+def _nonnegative_integer(name: str, value: object, *, positive: bool = False) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer")
+    if positive and value < 1:
+        raise ValueError(f"{name} must be greater than zero")
+    if not positive and value < 0:
+        raise ValueError(f"{name} must be zero or greater")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateHit:
+    """One window-local observation of a canonical candidate identity.
+
+    Hits are internal provenance metadata: they record how a candidate was
+    discovered without becoming part of the provider-facing candidate schema.
+    """
+
+    doc_id: str
+    evidence_id: str
+    window_id: str
+    reason: str
+    score: float | None = None
+    slice_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _strict_nonblank("doc_id", self.doc_id)
+        _strict_nonblank("evidence_id", self.evidence_id)
+        _strict_nonblank("window_id", self.window_id)
+        _strict_nonblank("reason", self.reason)
+        object.__setattr__(self, "score", _finite_score("score", self.score))
+        if not isinstance(self.slice_ids, tuple):
+            raise TypeError("slice_ids must be a tuple of strings")
+        slice_ids = tuple(
+            _strict_nonblank("slice_ids item", slice_id)
+            for slice_id in self.slice_ids
+        )
+        if len(slice_ids) != len(set(slice_ids)):
+            raise ValueError("slice_ids must be unique")
+        # Reassigning a fresh tuple prevents an exotic tuple subclass from
+        # retaining mutable behaviour behind this frozen value object.
+        object.__setattr__(self, "slice_ids", slice_ids)
+
+
 class CandidateEvidence(PipelineModel):
     """One source-backed item shortlisted before global selection."""
 
@@ -25,10 +91,30 @@ class CandidateEvidence(PipelineModel):
     reason: str
     score: float | None = None
     _transport_contents: tuple[dict[str, object], ...] = PrivateAttr(default=())
+    _hits: tuple[CandidateHit, ...] = PrivateAttr(default=())
 
     _doc_id_is_nonempty = field_validator("doc_id")(_nonempty)
     _evidence_id_is_nonempty = field_validator("evidence_id")(_nonempty)
     _reason_is_nonempty = field_validator("reason")(_nonempty)
+
+    def with_hit(self, hit: CandidateHit) -> "CandidateEvidence":
+        """Return a copy carrying one additional, identity-matched hit."""
+        return self.with_hits((hit,))
+
+    def with_hits(self, hits: Sequence[CandidateHit]) -> "CandidateEvidence":
+        """Return a copy carrying identity-matched, de-duplicated hit metadata."""
+        if any(not isinstance(hit, CandidateHit) for hit in hits):
+            raise TypeError("hits must contain CandidateHit values")
+        for hit in hits:
+            if (hit.doc_id, hit.evidence_id) != (self.doc_id, self.evidence_id):
+                raise ValueError("candidate hit identity must match candidate evidence")
+        clone = self.model_copy(deep=True)
+        clone._hits = tuple(dict.fromkeys((*self._hits, *hits)))
+        return clone
+
+    def hits(self) -> tuple[CandidateHit, ...]:
+        """Return immutable provenance metadata in deterministic arrival order."""
+        return self._hits
 
     def with_transport_content(self, content: dict[str, object]) -> "CandidateEvidence":
         """Attach deterministic source content without changing public identity/schema."""
@@ -98,6 +184,38 @@ class CandidateEvidence(PipelineModel):
     def transport_content(self) -> dict[str, object] | None:
         """Return a defensive copy of an ephemeral source slice, when present."""
         return deepcopy(self._transport_contents[0]) if self._transport_contents else None
+
+
+class CandidateDescriptor(PipelineModel):
+    """Compact public candidate contract for reduction and observability."""
+
+    doc_id: str = Field(strict=True)
+    evidence_id: str = Field(strict=True)
+    kind: str = Field(strict=True)
+    reason: str = Field(strict=True)
+    score: float | None = Field(default=None, strict=True)
+    hit_count: int = Field(default=1, strict=True)
+    slice_count: int = Field(default=0, strict=True)
+
+    _doc_id_is_nonempty = field_validator("doc_id")(_nonempty)
+    _evidence_id_is_nonempty = field_validator("evidence_id")(_nonempty)
+    _kind_is_nonempty = field_validator("kind")(_nonempty)
+    _reason_is_nonempty = field_validator("reason")(_nonempty)
+
+    @field_validator("score")
+    @classmethod
+    def _score_is_finite(cls, value: float | None) -> float | None:
+        return _finite_score("score", value)
+
+    @field_validator("hit_count")
+    @classmethod
+    def _hit_count_is_positive(cls, value: int) -> int:
+        return _nonnegative_integer("hit_count", value, positive=True)
+
+    @field_validator("slice_count")
+    @classmethod
+    def _slice_count_is_nonnegative(cls, value: int) -> int:
+        return _nonnegative_integer("slice_count", value)
 
 
 def _canonical_value(value: object) -> str:

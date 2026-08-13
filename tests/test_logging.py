@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from io import StringIO
 from pathlib import Path
 
 from docx import Document
@@ -24,6 +25,27 @@ def test_get_logger_does_not_configure_process_sinks() -> None:
     before = len(logger._core.handlers)  # type: ignore[attr-defined]
     get_logger(operation="test")
     assert len(logger._core.handlers) == before  # type: ignore[attr-defined]
+
+
+def test_presentation_console_logging_handles_dictionary_and_list_fields() -> None:
+    from loguru import logger
+
+    from presentation_pipeline.observability import console_formatter
+
+    output = StringIO()
+    handler = logger.add(output, format=console_formatter)
+    try:
+        logger.bind(
+            event="indexing_complete",
+            evidence_kind_counts={"table": 2, "list": 1},
+            retained_evidence_kinds=["table", "list"],
+        ).info("indexing_complete")
+    finally:
+        logger.remove(handler)
+
+    rendered = output.getvalue()
+    assert "evidence_kind_counts={table:2,list:1}" in rendered
+    assert "retained_evidence_kinds=[table,list]" in rendered
 
 
 def test_cli_logging_flags_and_no_document_text_leakage(tmp_path: Path, capsys: object) -> None:

@@ -16,6 +16,7 @@ from presentation_pipeline.retrieval import (
     LocalCandidateSelection,
     WindowedLLMEvidenceRetriever,
 )
+from presentation_pipeline.retrieval.models import CandidateHit, CandidateReductionSelection
 from presentation_pipeline.planning.models import EvidenceRef
 from presentation_pipeline.understanding.models import DocumentDigest, KeyFact, TopicDigest
 
@@ -166,7 +167,7 @@ def test_large_text_is_resliced_for_actual_discovery_overhead() -> None:
     assert [candidate.evidence_id for candidate in result.candidates] == ["e-a-0"]
 
 
-def test_transport_trimming_fails_loudly_for_first_nonfitting_slice_and_keeps_later_candidate() -> None:
+def test_reduction_uses_descriptors_not_transport_content() -> None:
     requirements = PresentationRequirements(goal="brief", audience="team", target_slide_count=1)
     budget = RetrievalBudget(
         request_budget=InputBudget(2_000), reduction_budget=InputBudget(1_000),
@@ -175,25 +176,132 @@ def test_transport_trimming_fails_loudly_for_first_nonfitting_slice_and_keeps_la
     retriever = WindowedLLMEvidenceRetriever(
         _CandidateGenerator(), token_counter=Utf8ByteTokenEstimator(), budget=budget, concurrency=1
     )
-    giant = CandidateEvidence(doc_id="a", evidence_id="e-a-0", reason="giant").with_transport_contents([
+    giant = CandidateEvidence(doc_id="a", evidence_id="e-a-0", reason="giant", score=0.8).with_transport_contents([
         {"evidence_id": "e-a-0", "kind": "text", "text": "x" * 5_000, "slice": {"slice_id": "slice-0000", "index": 0}},
         {"evidence_id": "e-a-0", "kind": "text", "text": "small", "slice": {"slice_id": "slice-0001", "index": 1}},
-    ])
-    with pytest.raises(CandidateRetrievalError, match="one candidate transport slice"):
-        retriever._fit_candidate_transport(giant, [_index("a")], requirements)
+    ]).with_hit(CandidateHit("a", "e-a-0", "window-0000", "giant", 0.8, ("slice-0000", "slice-0001")))
+    from presentation_pipeline.retrieval.windowed import build_candidate_reduction_input
+    payload = build_candidate_reduction_input(requirements, [giant], [_index("a")], target_count=1)
+    rendered = repr(payload)
+    assert payload["target_count"] == 1
+    assert payload["candidate_descriptors"] == [{
+        "doc_id": "a", "evidence_id": "e-a-0", "kind": "text", "reason": "giant",
+        "score": 0.8, "hit_count": 1, "slice_count": 2,
+    }]
+    assert "transport_slices" not in rendered and "x" * 100 not in rendered and "content" not in rendered
+    assert retriever._candidate_groups([giant], [_index("a")], requirements) == [[giant]]
 
-    first = CandidateEvidence(doc_id="a", evidence_id="e-a-0", reason="first").with_transport_contents([
-        {"evidence_id": "e-a-0", "kind": "text", "text": "one", "slice": {"slice_id": "slice-0000", "index": 0}},
-        {"evidence_id": "e-a-0", "kind": "text", "text": "x" * 5_000, "slice": {"slice_id": "slice-0001", "index": 1}},
-    ])
-    later = CandidateEvidence(doc_id="a", evidence_id="e-a-1", reason="later").with_transport_content(
-        {"evidence_id": "e-a-1", "kind": "text", "text": "later"}
+
+def test_hit_aware_hydration_prioritizes_relevant_later_slice() -> None:
+    requirements = PresentationRequirements(goal="brief", audience="team", target_slide_count=1)
+    retriever = WindowedLLMEvidenceRetriever(
+        _CandidateGenerator(),
+        token_counter=Utf8ByteTokenEstimator(),
+        budget=RetrievalBudget(selection_budget=InputBudget(1_000)),
     )
-    retained = retriever._fit_selection_transport(
-        [first, later], [_index("a")], [DocumentDigest(doc_id="a", summary="digest")], requirements
+    candidate = CandidateEvidence(
+        doc_id="a", evidence_id="e-a-0", reason="later slice", score=0.9
+    ).with_transport_contents([
+        {
+            "evidence_id": "e-a-0",
+            "kind": "text",
+            "text": "x" * 5_000,
+            "slice": {"slice_id": "slice-0000", "index": 0},
+        },
+        {
+            "evidence_id": "e-a-0",
+            "kind": "text",
+            "text": "relevant later evidence",
+            "slice": {"slice_id": "slice-0001", "index": 1},
+        },
+    ]).with_hit(
+        CandidateHit("a", "e-a-0", "window-0001", "later slice", 0.9, ("slice-0001",))
     )
-    assert [candidate.evidence_id for candidate in retained] == ["e-a-0", "e-a-1"]
-    assert [item["text"] for item in retained[0].transport_contents()] == ["one"]
+
+    hydrated = retriever._fit_selection_transport(
+        [candidate],
+        [_index("a")],
+        [DocumentDigest(doc_id="a", summary="digest")],
+        requirements,
+    )
+
+    assert [
+        content["slice"]["slice_id"]
+        for content in hydrated[0].transport_contents()
+    ] == ["slice-0001"]
+    assert len(candidate.transport_contents()) == 2  # canonical candidate was not mutated
+
+
+class _ReductionGenerator:
+    def __init__(self, *, over_return: bool = False, outside: bool = False) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.over_return = over_return
+        self.outside = outside
+
+    async def generate(self, *, input_data, response_model, **_kwargs):
+        if response_model is LocalCandidateSelection:
+            return {"candidates": []}
+        assert response_model is CandidateReductionSelection
+        self.calls.append(input_data)
+        descriptors = input_data["candidate_descriptors"]
+        if self.outside:
+            return {"candidates": [{"doc_id": "outside", "evidence_id": "bad"}]}
+        chosen = descriptors if self.over_return else descriptors[:input_data["target_count"]]
+        return {"candidates": [
+            {"doc_id": item["doc_id"], "evidence_id": item["evidence_id"]}
+            for item in reversed(chosen)
+        ]}
+
+
+def test_reduction_caps_all_identities_and_preserves_model_order() -> None:
+    requirements = PresentationRequirements(goal="brief", audience="team", target_slide_count=1)
+    budget = RetrievalBudget(
+        reduction_budget=InputBudget(2_000), reduction_keep_ratio=0.5,
+        max_global_candidates=1,
+    )
+    generator = _ReductionGenerator(over_return=True)
+    retriever = WindowedLLMEvidenceRetriever(generator, token_counter=Utf8ByteTokenEstimator(), budget=budget)
+    candidates = [CandidateEvidence(doc_id="a", evidence_id=f"e-a-{number}", reason="r") for number in range(3)]
+    result = asyncio.run(retriever._reduce_once(
+        candidates, [_index("a", 3)], requirements,
+        __import__("presentation_pipeline.budgeting", fromlist=["GenerationLimiter"]).GenerationLimiter(generator, token_counter=Utf8ByteTokenEstimator()),
+    ))
+    # target=ceil(3*.5)=2; response priority is reversed and remains intact.
+    assert [item.evidence_id for item in result] == ["e-a-2", "e-a-1"]
+    assert generator.calls[0]["target_count"] == 2
+
+
+def test_reduction_rejects_out_of_scope_identity_strictly() -> None:
+    requirements = PresentationRequirements(goal="brief", audience="team", target_slide_count=1)
+    generator = _ReductionGenerator(outside=True)
+    retriever = WindowedLLMEvidenceRetriever(generator, token_counter=Utf8ByteTokenEstimator(), budget=RetrievalBudget())
+    candidate = CandidateEvidence(doc_id="a", evidence_id="e-a-0", reason="r")
+    with pytest.raises(CandidateRetrievalError, match="outside"):
+        asyncio.run(retriever._reduce_once(
+            [candidate, CandidateEvidence(doc_id="a", evidence_id="e-a-1", reason="r")], [_index("a")], requirements,
+            __import__("presentation_pipeline.budgeting", fromlist=["GenerationLimiter"]).GenerationLimiter(generator, token_counter=Utf8ByteTokenEstimator()),
+        ))
+
+
+def test_dedup_merges_duplicate_hits_and_singleton_reduction_bypasses_model() -> None:
+    from presentation_pipeline.retrieval.windowed import _dedupe_candidates
+    hit = CandidateHit("a", "e-a-0", "window-0000", "first", 0.3, ("slice-0000",))
+    stronger = CandidateHit("a", "e-a-0", "window-0001", "stronger", 0.9, ("slice-0001",))
+    first = CandidateEvidence(doc_id="a", evidence_id="e-a-0", reason="first", score=0.3).with_hit(hit)
+    second = CandidateEvidence(doc_id="a", evidence_id="e-a-0", reason="stronger", score=0.9).with_hit(stronger)
+    merged = _dedupe_candidates([first, second, first])[0]
+    assert merged.reason == "stronger" and merged.score == 0.9
+    assert merged.hits() == (hit, stronger)
+
+    requirements = PresentationRequirements(goal="brief", audience="team", target_slide_count=1)
+    generator = _ReductionGenerator()
+    retriever = WindowedLLMEvidenceRetriever(generator, token_counter=Utf8ByteTokenEstimator(), budget=RetrievalBudget())
+    result = asyncio.run(retriever._reduce_once(
+        [merged], [_index("a")], requirements,
+        __import__("presentation_pipeline.budgeting", fromlist=["GenerationLimiter"]).GenerationLimiter(generator, token_counter=Utf8ByteTokenEstimator()),
+    ))
+    assert result == [merged]
+    assert generator.calls == []
 
 
 def test_candidate_discovery_digest_context_strips_global_evidence_ids() -> None:

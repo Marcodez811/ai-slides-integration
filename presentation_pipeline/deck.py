@@ -261,7 +261,13 @@ async def generate_deck(
             physical_slides=summary["physical_slide_count"],
             average_estimate_to_actual_ratio=summary["average_estimate_to_actual_ratio"],
             median_estimate_to_actual_ratio=summary["median_estimate_to_actual_ratio"],
+            p90_estimate_to_actual_ratio=summary["p90_estimate_to_actual_ratio"],
+            p95_estimate_to_actual_ratio=summary["p95_estimate_to_actual_ratio"],
             max_estimate_to_actual_ratio=summary["max_estimate_to_actual_ratio"],
+            estimate_to_actual_ratio_by_stage=summary["estimate_to_actual_ratio_by_stage"],
+            estimate_to_actual_ratio_by_stage_and_response_model=summary[
+                "estimate_to_actual_ratio_by_stage_and_response_model"
+            ],
             calls_by_response_model=summary["calls_by_response_model"],
             calls_by_stage=summary["calls_by_stage"],
         )

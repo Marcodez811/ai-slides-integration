@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import sys
 import time
+from math import ceil
 from contextvars import ContextVar, Token
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -38,6 +38,10 @@ class RunMetrics:
         self.calls_by_response_model: dict[str, int] = {}
         self.calls_by_stage: dict[str, int] = {}
         self.estimated_to_actual_ratios: list[float] = []
+        self.estimated_to_actual_ratios_by_stage: dict[str, list[float]] = {}
+        self.estimated_to_actual_ratios_by_stage_and_model: dict[
+            str, dict[str, list[float]]
+        ] = {}
         self.document_count = 0
         self.window_count = 0
         self.chunk_digest_count = 0
@@ -60,9 +64,21 @@ class RunMetrics:
         if isinstance(latency, (int, float)) and latency >= 0:
             self.provider_latency_ms += float(latency)
 
-    def record_estimate_ratio(self, ratio: float) -> None:
+    def record_estimate_ratio(
+        self,
+        ratio: float,
+        *,
+        stage: str | None = None,
+        response_model: str | None = None,
+    ) -> None:
         if ratio >= 0:
             self.estimated_to_actual_ratios.append(ratio)
+            if stage is not None:
+                self.estimated_to_actual_ratios_by_stage.setdefault(stage, []).append(ratio)
+                if response_model is not None:
+                    self.estimated_to_actual_ratios_by_stage_and_model.setdefault(
+                        stage, {}
+                    ).setdefault(response_model, []).append(ratio)
 
     def record_event(self, event: str, fields: dict[str, object]) -> None:
         if event == "document_digest_start":
@@ -80,6 +96,19 @@ class RunMetrics:
 
     def summary(self) -> dict[str, object]:
         ratios = sorted(self.estimated_to_actual_ratios)
+        stage_ratios = {
+            stage: _ratio_summary(values)
+            for stage, values in sorted(self.estimated_to_actual_ratios_by_stage.items())
+        }
+        stage_and_model_ratios = {
+            stage: {
+                model: _ratio_summary(values)
+                for model, values in sorted(models.items())
+            }
+            for stage, models in sorted(
+                self.estimated_to_actual_ratios_by_stage_and_model.items()
+            )
+        }
         return {
             "provider_call_count": self.provider_calls,
             "actual_provider_input_tokens": self.provider_input_tokens,
@@ -96,7 +125,11 @@ class RunMetrics:
             "physical_slide_count": self.physical_slide_count,
             "average_estimate_to_actual_ratio": (sum(ratios) / len(ratios)) if ratios else None,
             "median_estimate_to_actual_ratio": (ratios[len(ratios) // 2] if ratios else None),
+            "p90_estimate_to_actual_ratio": _nearest_rank_percentile(ratios, 0.90),
+            "p95_estimate_to_actual_ratio": _nearest_rank_percentile(ratios, 0.95),
             "max_estimate_to_actual_ratio": (max(ratios) if ratios else None),
+            "estimate_to_actual_ratio_by_stage": stage_ratios,
+            "estimate_to_actual_ratio_by_stage_and_response_model": stage_and_model_ratios,
         }
 
 
@@ -117,9 +150,13 @@ def console_formatter(record: dict[str, Any]) -> str:
             continue
         rendered = _console_value(value)
         if rendered is not None:
-            fields.append(f"{key}={rendered}")
+            # Loguru parses the returned formatter value as a format string.
+            # Structured values naturally contain braces, so escape every
+            # dynamic component before returning its template.
+            fields.append(f"{_escape_loguru_braces(str(key))}={_escape_loguru_braces(rendered)}")
     suffix = (" | " + " ".join(fields)) if fields else ""
-    return "{time:HH:mm:ss} | {level} | " + str(event or "{message}") + suffix + "\n"
+    rendered_event = "{message}" if event is None else _escape_loguru_braces(str(event))
+    return "{time:HH:mm:ss} | {level} | " + rendered_event + suffix + "\n"
 
 
 def new_run_id() -> str:
@@ -199,20 +236,22 @@ class stage_timer(AbstractContextManager["stage_timer"]):
 
 def telemetry_logger(event: object) -> None:
     """Persist provider telemetry without request or response content."""
-    values: dict[str, Any]
-    if is_dataclass(event) and not isinstance(event, type):
-        values = asdict(event)
-    elif isinstance(event, dict):
-        values = event
+    raw_values: dict[str, Any]
+    if isinstance(event, dict):
+        raw_values = event
     else:
-        values = {
+        raw_values = {
             name: getattr(event, name)
-            for name in (
-                "provider", "model", "response_model", "request_id", "latency_ms",
-                "input_tokens", "output_tokens", "total_tokens", "outcome", "error_type",
-            )
+            for name in _PROVIDER_TELEMETRY_FIELDS
             if hasattr(event, name)
         }
+    # Providers may attach payloads or arbitrary debugging data to their event
+    # objects. Keep this allow-list deliberately limited to operational metadata.
+    values = {
+        name: raw_values[name]
+        for name in _PROVIDER_TELEMETRY_FIELDS
+        if name in raw_values
+    }
     if _active_metrics is not None:
         _active_metrics.record_provider(values)
     safe_event("provider_call", **values)
@@ -221,7 +260,11 @@ def telemetry_logger(event: object) -> None:
     if correlation is not None and isinstance(actual, int) and actual > 0:
         ratio = correlation.estimated_input_tokens / actual
         if _active_metrics is not None:
-            _active_metrics.record_estimate_ratio(ratio)
+            _active_metrics.record_estimate_ratio(
+                ratio,
+                stage=correlation.stage,
+                response_model=correlation.response_model,
+            )
         safe_event(
             "estimated_vs_actual_tokens",
             stage=correlation.stage,
@@ -265,6 +308,44 @@ def _console_value(value: object) -> str | None:
     ):
         return "{" + ",".join(f"{key}:{item}" for key, item in list(value.items())[:8]) + "}"
     return None
+
+
+def _escape_loguru_braces(value: str) -> str:
+    """Escape dynamic data embedded into a Loguru format-string template."""
+    return value.replace("{", "{{").replace("}", "}}")
+
+
+def _nearest_rank_percentile(values: list[float], percentile: float) -> float | None:
+    """Return a deterministic nearest-rank percentile for pre-sorted values."""
+    if not values:
+        return None
+    return values[ceil(percentile * len(values)) - 1]
+
+
+def _ratio_summary(values: list[float]) -> dict[str, float | int | None]:
+    """Stage-level ratio stats; p90/p95 use the nearest-rank convention."""
+    sorted_values = sorted(values)
+    return {
+        "count": len(sorted_values),
+        # Preserve the existing upper-middle median behavior for even samples.
+        "median": sorted_values[len(sorted_values) // 2] if sorted_values else None,
+        "p90": _nearest_rank_percentile(sorted_values, 0.90),
+        "p95": _nearest_rank_percentile(sorted_values, 0.95),
+    }
+
+
+_PROVIDER_TELEMETRY_FIELDS = frozenset({
+    "provider",
+    "model",
+    "response_model",
+    "request_id",
+    "latency_ms",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "outcome",
+    "error_type",
+})
 
 
 def _safe_value(value: object) -> object:
